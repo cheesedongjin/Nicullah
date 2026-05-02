@@ -232,6 +232,24 @@ def public_state(state: dict) -> dict:
     return public
 
 
+def _list_dir(directory: str, depth: int = 0) -> list[dict]:
+    if not directory or not os.path.isdir(directory) or depth > 4:
+        return []
+    result = []
+    try:
+        entries = sorted(os.scandir(directory), key=lambda e: (not e.is_dir(), e.name.lower()))
+        for entry in entries:
+            if entry.name.startswith(".") and entry.name not in {".warroom"}:
+                continue
+            node: dict = {"name": entry.name, "type": "dir" if entry.is_dir() else "file"}
+            if entry.is_dir():
+                node["children"] = _list_dir(entry.path, depth + 1)
+            result.append(node)
+    except PermissionError:
+        pass
+    return result
+
+
 def list_projects() -> list[dict]:
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     projects = []
@@ -1039,6 +1057,12 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
             if len(parts) == 3 and parts[:2] == ["api", "projects"]:
                 root = project_root(parts[2])
                 self.write_json(public_state(load_state(root)))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "files":
+                root = project_root(parts[2])
+                state_data = load_state(root)
+                directory = state_data.get("directory", "")
+                self.write_json({"root": directory, "files": _list_dir(directory)})
                 return
         except CLIENT_DISCONNECT_ERRORS:
             return
