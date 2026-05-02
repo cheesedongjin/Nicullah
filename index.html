@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Agent War Room</title>
+    <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="%23020302"/><path d="M14 47V17h36v30H14Z" fill="none" stroke="%23d9ff8b" stroke-width="3"/><path d="M22 39 32 21l10 18M26 32h12" stroke="%2313dced" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>' />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="프로젝트">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">AW</span>
+          <div>
+            <strong>AI Agent War Room</strong>
+            <small>Project Command</small>
+          </div>
+        </div>
+
+        <button class="new-project-button" id="newProjectButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          새 프로젝트
+        </button>
+
+        <div class="sidebar-section">
+          <div class="sidebar-label">Projects</div>
+          <div class="project-list" id="projectList" role="list"></div>
+        </div>
+
+        <div class="sidebar-footer">
+          <span class="status-dot"></span>
+          <span id="apiStatusLabel">Gemini Required</span>
+        </div>
+      </aside>
+
+      <main class="main-screen" aria-label="워룸">
+        <header class="room-header">
+          <div>
+            <p class="system-label">STATUS : <span id="projectStatusLabel">STANDBY</span></p>
+            <h1 id="projectTitle">AI Agent War Room</h1>
+          </div>
+          <div class="room-actions">
+            <button class="ghost-button" id="openDecisionButton" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 21h18L12 3Z"/><path d="M12 9v4M12 17h.01"/></svg>
+              승인 요청
+            </button>
+          </div>
+        </header>
+
+        <section class="war-room" aria-label="실시간 워룸">
+          <canvas id="thinkGraph" width="1400" height="900" aria-label="에이전트 사고 그래프"></canvas>
+
+          <div class="graph-overlay">
+            <span>ROOT GOAL</span>
+            <strong id="rootGoalLabel">프로젝트를 생성하면 워룸이 시작됩니다.</strong>
+            <small id="projectDirectoryLabel">no project directory</small>
+          </div>
+
+          <div class="backend-lock" id="backendLock" hidden>
+            <strong>Gemini backend required</strong>
+            <span id="backendLockReason"></span>
+          </div>
+
+          <section class="agent-strip" aria-label="에이전트 상태">
+            <article class="agent-card" data-agent="pm">
+              <span class="agent-icon" aria-hidden="true">PM</span>
+              <div>
+                <h2>PM</h2>
+                <p id="pmState">대기 중</p>
+              </div>
+            </article>
+            <article class="agent-card" data-agent="designer">
+              <span class="agent-icon" aria-hidden="true">DS</span>
+              <div>
+                <h2>Designer</h2>
+                <p id="designerState">대기 중</p>
+              </div>
+            </article>
+            <article class="agent-card" data-agent="backend">
+              <span class="agent-icon" aria-hidden="true">BE</span>
+              <div>
+                <h2>Backend</h2>
+                <p id="backendState">대기 중</p>
+              </div>
+            </article>
+            <article class="agent-card" data-agent="frontend">
+              <span class="agent-icon" aria-hidden="true">FE</span>
+              <div>
+                <h2>Frontend</h2>
+                <p id="frontendState">대기 중</p>
+              </div>
+            </article>
+            <article class="agent-card" data-agent="qa">
+              <span class="agent-icon" aria-hidden="true">QA</span>
+              <div>
+                <h2>QA / SET</h2>
+                <p id="qaState">대기 중</p>
+              </div>
+            </article>
+          </section>
+
+          <ol class="activity-rail" id="activityFeed" aria-label="에이전트 로그"></ol>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="modal" id="projectModal" aria-labelledby="projectModalTitle">
+      <form id="projectForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <p class="system-label">NEW PROJECT</p>
+            <h2 id="projectModalTitle">프로젝트 생성</h2>
+          </div>
+          <button class="icon-button" id="closeProjectModal" type="button" aria-label="닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+
+        <label>
+          프로젝트 이름
+          <input id="projectNameInput" name="projectName" type="text" value="Autonomous Agent Workflow" required />
+        </label>
+
+        <label>
+          PO 비전
+          <textarea id="projectVisionInput" name="projectVision" rows="6" required>Gemini 기반 에이전트들이 서비스 기획, UI 설계, 코드 구현, QA를 순환하며 협업하는 개발 워크플로우 앱을 만들어줘.</textarea>
+        </label>
+
+        <div class="modal-options">
+          <span id="projectModalHint">Gemini가 없으면 프로젝트를 시작할 수 없습니다.</span>
+        </div>
+
+        <footer class="modal-footer">
+          <button class="secondary-button" id="cancelProjectButton" type="button">취소</button>
+          <button class="primary-button" id="projectSubmitButton" type="submit">프로젝트 시작</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog class="modal decision-modal" id="decisionModal" aria-labelledby="decisionModalTitle">
+      <form id="decisionForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <p class="system-label">APPROVAL REQUIRED</p>
+            <h2 id="decisionModalTitle">선택형 의사결정</h2>
+          </div>
+          <button class="icon-button" id="closeDecisionModal" type="button" aria-label="닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+
+        <p class="decision-question" id="decisionQuestion">AI 팀이 PO 승인을 요청했습니다.</p>
+        <div class="choice-grid" id="choiceGrid"></div>
+
+        <div class="custom-panel" id="customPanel" hidden>
+          <label>
+            직접 입력
+            <textarea id="customPrompt" rows="4" placeholder="예: 외부 결제 API는 쓰지 말고 자체 DB 모델로 먼저 진행"></textarea>
+          </label>
+        </div>
+
+        <footer class="modal-footer">
+          <button class="secondary-button" id="deferDecisionButton" type="button">나중에</button>
+          <button class="primary-button" id="confirmDecisionButton" type="submit">선택 승인</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <template id="projectItemTemplate">
+      <button class="project-item" type="button">
+        <span class="project-glyph"></span>
+        <span>
+          <strong></strong>
+          <small></small>
+        </span>
+      </button>
+    </template>
+
+    <template id="choiceTemplate">
+      <button class="choice-card" type="button">
+        <span>
+          <span class="recommendation"></span>
+          <strong></strong>
+          <small></small>
+        </span>
+        <span class="swatches"></span>
+      </button>
+    </template>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
