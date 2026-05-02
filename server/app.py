@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from gemini_retry_handler import GeminiRetryHandler
 
@@ -241,13 +241,111 @@ def _list_dir(directory: str, depth: int = 0) -> list[dict]:
         for entry in entries:
             if entry.name.startswith(".") and entry.name not in {".warroom"}:
                 continue
-            node: dict = {"name": entry.name, "type": "dir" if entry.is_dir() else "file"}
+            try:
+                stat = entry.stat()
+                mtime = int(stat.st_mtime)
+                size = stat.st_size if entry.is_file() else 0
+            except OSError:
+                mtime = 0
+                size = 0
+            node: dict = {
+                "name": entry.name,
+                "type": "dir" if entry.is_dir() else "file",
+                "size": size,
+                "mtime": mtime,
+            }
             if entry.is_dir():
                 node["children"] = _list_dir(entry.path, depth + 1)
             result.append(node)
     except PermissionError:
         pass
     return result
+
+
+def recent_files(root: Path, limit: int = 10) -> list[dict]:
+    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
+    files = []
+    for path in root.rglob("*"):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(root)
+        if any(part in ignored for part in rel.parts):
+            continue
+        try:
+            files.append({"path": str(rel).replace("\\", "/"), "mtime": int(path.stat().st_mtime)})
+        except OSError:
+            continue
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return files[:limit]
+
+
+def project_stats(root: Path) -> dict:
+    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
+    ext_counts: dict[str, int] = {}
+    total_lines = 0
+    total_files = 0
+    total_size = 0
+    for path in root.rglob("*"):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(root)
+        if any(part in ignored for part in rel.parts):
+            continue
+        total_files += 1
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            total_size += size
+            ext = path.suffix.lower() or "(no ext)"
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            if size < 500_000:
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    total_lines += text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+                except Exception:
+                    pass
+        except OSError:
+            continue
+    return {
+        "total_files": total_files,
+        "total_lines": total_lines,
+        "total_size": total_size,
+        "extensions": ext_counts,
+    }
+
+
+def search_project(root: Path, query: str, max_results: int = 30) -> list[dict]:
+    if not query or len(query.strip()) < 2:
+        return []
+    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
+    try:
+        pattern = re.compile(re.escape(query.strip()), re.IGNORECASE)
+    except re.error:
+        return []
+    results = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(root)
+        if any(part in ignored for part in rel.parts):
+            continue
+        try:
+            if path.stat().st_size > 500_000:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        matches = []
+        for i, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                matches.append({"line": i, "text": line.strip()[:200]})
+                if len(matches) >= 5:
+                    break
+        if matches:
+            results.append({"file": str(rel).replace("\\", "/"), "matches": matches})
+            if len(results) >= max_results:
+                break
+    return results
 
 
 def list_projects() -> list[dict]:
@@ -341,11 +439,16 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
         "recent_logs": state.get("logs", [])[-20:],
         "file_tree": project_tree(root),
         "file_excerpts": excerpts,
+        "recently_modified_files": recent_files(root, 8),
+        "search_results": state.get("search_results", [])[-3:],
+        "project_stats": state.get("project_stats", {}),
         "allowed_actions": [
             "write_file",
             "append_file",
             "edit_file",
             "read_file",
+            "search_files",
+            "get_project_stats",
             "run_command",
             "capture_preview",
             "add_ticket",
@@ -398,6 +501,8 @@ Return strict JSON only:
     {{"type": "append_file", "path": "relative/path", "content": "text to append"}},
     {{"type": "edit_file", "path": "relative/path", "find": "old text", "replace": "new text"}},
     {{"type": "read_file", "path": "relative/path"}},
+    {{"type": "search_files", "query": "text to search across all project files"}},
+    {{"type": "get_project_stats"}},
     {{"type": "run_command", "command": ["python", "-m", "unittest"]}},
     {{"type": "capture_preview", "url": "http://127.0.0.1:3000", "note": "what to inspect"}},
     {{"type": "add_ticket", "title": "task", "owner": "frontend", "status": "ready|progress|review|blocked|done", "priority": "P0|P1|P2|P3", "description": "scope", "acceptance_criteria": ["criterion"]}},
@@ -412,6 +517,12 @@ Return strict JSON only:
 
 Prefer small, safe file edits. Write complete files when creating new files.
 Never invent that a command passed unless you ran it. If a role-specific artifact is missing, create or update it before relying on it.
+
+Code navigation guidance:
+- Use search_files before editing to locate existing implementations, imports, or usages.
+- Use get_project_stats on first turn to understand project scope and language breakdown.
+- Results from search_files and get_project_stats appear in your next turn's context under search_results and project_stats.
+- recently_modified_files in your context shows what changed most recently — read those before writing to avoid conflicts.
 """
 
 
@@ -683,6 +794,41 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
             elif action_type == "read_file":
                 target = safe_path(root, action["path"])
                 observations.append(f"read {action['path']}:\n{read_excerpt(target, 3000)}")
+            elif action_type == "search_files":
+                query = action.get("query", "").strip()
+                if not query or len(query) < 2:
+                    observations.append("search_files: query must be at least 2 characters")
+                else:
+                    results = search_project(root, query, max_results=20)
+                    entry = {
+                        "agent": agent_id,
+                        "time": now(),
+                        "query": query,
+                        "results": results,
+                    }
+                    state.setdefault("search_results", []).append(entry)
+                    state["search_results"] = state["search_results"][-5:]
+                    if results:
+                        summary = "; ".join(
+                            f"{r['file']}:L{r['matches'][0]['line']}" for r in results[:5]
+                        )
+                        observations.append(
+                            f"search '{query}' → {len(results)} files: {summary}"
+                        )
+                    else:
+                        observations.append(f"search '{query}' → no matches")
+            elif action_type == "get_project_stats":
+                stats = project_stats(root)
+                state["project_stats"] = {**stats, "agent": agent_id, "time": now()}
+                ext_summary = ", ".join(
+                    f"{ext}:{cnt}"
+                    for ext, cnt in sorted(stats["extensions"].items(), key=lambda x: -x[1])[:6]
+                )
+                observations.append(
+                    f"project stats: {stats['total_files']} files, "
+                    f"{stats['total_lines']} lines, "
+                    f"{stats['total_size'] // 1024} KB | {ext_summary}"
+                )
             elif action_type == "run_command":
                 result = run_command(root, action.get("command", []))
                 state.setdefault("command_runs", []).append({
@@ -1063,6 +1209,23 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
                 state_data = load_state(root)
                 directory = state_data.get("directory", "")
                 self.write_json({"root": directory, "files": _list_dir(directory)})
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "stats":
+                root = project_root(parts[2])
+                self.write_json(project_stats(root))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "search":
+                qs = parse_qs(parsed.query)
+                query = qs.get("q", [""])[0]
+                root = project_root(parts[2])
+                self.write_json({"results": search_project(root, query), "query": query})
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "file":
+                qs = parse_qs(parsed.query)
+                rel = qs.get("path", [""])[0]
+                root = project_root(parts[2])
+                target = safe_path(root, rel)
+                self.write_json({"path": rel, "content": read_excerpt(target, 50_000)})
                 return
         except CLIENT_DISCONNECT_ERRORS:
             return

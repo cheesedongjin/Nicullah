@@ -8,7 +8,12 @@ let state = {
   selectedChoiceId: null,
   activeTab: "logs",
   polling: null,
+  openFilePath: null,
+  openFileContent: "",
+  searchQuery: "",
 };
+
+let searchTimer = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -52,6 +57,35 @@ function shortPath(path) {
   if (!path) return "";
   const normalized = path.replaceAll("\\", "/");
   return normalized.split("/").slice(-3).join("/");
+}
+
+function formatSize(bytes) {
+  if (bytes == null || bytes === 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatRelTime(mtime) {
+  const secs = Math.floor(Date.now() / 1000 - mtime);
+  if (secs < 60) return "방금";
+  if (secs < 3600) return `${Math.floor(secs / 60)}분 전`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}시간 전`;
+  return `${Math.floor(secs / 86400)}일 전`;
+}
+
+function flattenTree(nodes, prefix = "") {
+  const result = [];
+  for (const node of nodes || []) {
+    const path = prefix ? `${prefix}/${node.name}` : node.name;
+    if (node.type === "file") {
+      result.push({ path, size: node.size || 0, mtime: node.mtime || 0 });
+    }
+    if (node.children) {
+      result.push(...flattenTree(node.children, path));
+    }
+  }
+  return result;
 }
 
 // ─── Render ──────────────────────────────────────────────────────────────────
@@ -259,34 +293,160 @@ async function renderFiles(project) {
     return;
   }
 
-  panel.innerHTML = `<p class="loading-text">파일 목록 로딩 중...</p>`;
+  const currentQuery = state.searchQuery;
 
+  panel.innerHTML = `
+    <div class="file-search-bar">
+      <input class="file-search-input" type="search" placeholder="파일 내 텍스트 검색 (2자 이상)..." value="${escapeHtml(currentQuery)}" />
+    </div>
+    <div class="file-content-area"></div>
+    <div class="file-viewer" id="fileViewer" hidden>
+      <div class="file-viewer-header">
+        <span class="file-viewer-path"></span>
+        <button class="file-viewer-close" type="button" aria-label="닫기">✕</button>
+      </div>
+      <pre class="file-viewer-content"></pre>
+    </div>
+  `;
+
+  const searchInput = panel.querySelector(".file-search-input");
+  const contentArea = panel.querySelector(".file-content-area");
+  const viewer = panel.querySelector("#fileViewer");
+
+  searchInput.addEventListener("input", () => {
+    state.searchQuery = searchInput.value;
+    clearTimeout(searchTimer);
+    if (!state.searchQuery.trim() || state.searchQuery.trim().length < 2) {
+      loadFileTree(project, contentArea, viewer);
+    } else {
+      contentArea.innerHTML = `<p class="loading-text">검색 중...</p>`;
+      searchTimer = setTimeout(() => doSearch(project.id, state.searchQuery, contentArea, viewer), 400);
+    }
+  });
+
+  panel.querySelector(".file-viewer-close").addEventListener("click", () => {
+    viewer.hidden = true;
+    state.openFilePath = null;
+    state.openFileContent = "";
+  });
+
+  if (currentQuery && currentQuery.trim().length >= 2) {
+    contentArea.innerHTML = `<p class="loading-text">검색 중...</p>`;
+    await doSearch(project.id, currentQuery, contentArea, viewer);
+  } else {
+    await loadFileTree(project, contentArea, viewer);
+  }
+}
+
+async function loadFileTree(project, contentArea, viewer) {
+  contentArea.innerHTML = `<p class="loading-text">파일 목록 로딩 중...</p>`;
   try {
     const data = await api(`/api/projects/${project.id}/files`);
     const root = data.root || "";
     const files = data.files || [];
+    const allFiles = flattenTree(files);
+    const recentItems = [...allFiles].sort((a, b) => b.mtime - a.mtime).slice(0, 5);
 
-    panel.innerHTML = `
+    const recentHtml = recentItems.length ? `
+      <div class="section-title" style="margin-bottom:8px">최근 수정</div>
+      <div class="recent-files-list">
+        ${recentItems.map(f => `
+          <div class="recent-file-item" data-path="${escapeHtml(f.path)}">
+            <span class="recent-file-name">${escapeHtml(f.path.split("/").pop())}</span>
+            <span class="recent-file-time">${formatRelTime(f.mtime)}</span>
+          </div>
+        `).join("")}
+      </div>
+      <div class="section-title" style="margin:14px 0 8px">파일 트리</div>
+    ` : "";
+
+    contentArea.innerHTML = `
       <div class="file-root-path">${escapeHtml(root)}</div>
-      <div class="file-tree">${renderTree(files, 0)}</div>
+      ${recentHtml}
+      <div class="file-tree">${renderTree(files, 0, "")}</div>
     `;
-  } catch (err) {
-    panel.innerHTML = `<p class="empty-state">파일 목록을 가져올 수 없습니다.</p>`;
+
+    contentArea.querySelectorAll("[data-path]").forEach(el => {
+      el.addEventListener("click", () => viewFile(project.id, el.dataset.path, viewer));
+    });
+  } catch {
+    contentArea.innerHTML = `<p class="empty-state">파일 목록을 가져올 수 없습니다.</p>`;
+  }
+
+  if (state.openFilePath) {
+    viewer.hidden = false;
+    viewer.querySelector(".file-viewer-path").textContent = state.openFilePath;
+    viewer.querySelector(".file-viewer-content").textContent = state.openFileContent;
   }
 }
 
-function renderTree(nodes, depth) {
+async function doSearch(projectId, query, contentArea, viewer) {
+  try {
+    const data = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(query)}`);
+    renderSearchResults(contentArea, data.results || [], query, projectId, viewer);
+  } catch (err) {
+    contentArea.innerHTML = `<p class="empty-state">검색 오류: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderSearchResults(contentArea, results, query, projectId, viewer) {
+  if (!results.length) {
+    contentArea.innerHTML = `<p class="empty-state">"${escapeHtml(query)}" 검색 결과 없음</p>`;
+    return;
+  }
+  contentArea.innerHTML = `
+    <div class="search-result-header">${results.length}개 파일에서 발견</div>
+    ${results.map(r => `
+      <div class="search-result">
+        <button class="search-result-file" data-path="${escapeHtml(r.file)}">${escapeHtml(r.file)}</button>
+        ${r.matches.map(m => `
+          <div class="search-result-match">
+            <span class="match-line">${m.line}</span>
+            <span class="match-text">${escapeHtml(m.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+    `).join("")}
+  `;
+  contentArea.querySelectorAll(".search-result-file").forEach(el => {
+    el.addEventListener("click", () => viewFile(projectId, el.dataset.path, viewer));
+  });
+}
+
+async function viewFile(projectId, path, viewer) {
+  state.openFilePath = path;
+  state.openFileContent = "로딩 중...";
+  viewer.hidden = false;
+  viewer.querySelector(".file-viewer-path").textContent = path;
+  viewer.querySelector(".file-viewer-content").textContent = "로딩 중...";
+  viewer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  try {
+    const data = await api(`/api/projects/${projectId}/file?path=${encodeURIComponent(path)}`);
+    state.openFileContent = data.content || "(빈 파일)";
+    viewer.querySelector(".file-viewer-content").textContent = state.openFileContent;
+  } catch (err) {
+    state.openFileContent = `오류: ${err.message}`;
+    viewer.querySelector(".file-viewer-content").textContent = state.openFileContent;
+  }
+}
+
+function renderTree(nodes, depth, pathPrefix) {
   if (!nodes?.length) return "";
   const indent = depth * 14;
   return nodes
     .map((node) => {
       const isDir = node.type === "dir";
+      const fullPath = pathPrefix ? `${pathPrefix}/${node.name}` : node.name;
       const icon = isDir ? "▸" : "·";
       const nameClass = isDir ? "tree-name is-dir" : "tree-name";
-      const children = isDir && node.children ? renderTree(node.children, depth + 1) : "";
-      return `<div class="tree-node" style="padding-left:${indent}px">
+      const sizeHtml = !isDir && node.size ? `<span class="tree-size">${formatSize(node.size)}</span>` : "";
+      const pathAttr = !isDir ? `data-path="${escapeHtml(fullPath)}"` : "";
+      const clickClass = !isDir ? " is-clickable" : "";
+      const children = isDir && node.children ? renderTree(node.children, depth + 1, fullPath) : "";
+      return `<div class="tree-node${clickClass}" style="padding-left:${indent}px" ${pathAttr}>
         <span class="tree-icon">${icon}</span>
         <span class="${nameClass}">${escapeHtml(node.name)}</span>
+        ${sizeHtml}
       </div>${children}`;
     })
     .join("");

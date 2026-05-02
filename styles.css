@@ -793,10 +793,20 @@ h1 {
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 0;
+  padding: 4px 4px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
+  border-radius: 3px;
+}
+
+.tree-node.is-clickable {
+  cursor: pointer;
+}
+
+.tree-node.is-clickable:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
 }
 
 .tree-icon {
@@ -808,10 +818,222 @@ h1 {
 .tree-name {
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
 }
 
 .tree-name.is-dir {
   color: var(--accent);
+}
+
+.tree-size {
+  flex: 0 0 auto;
+  color: var(--soft);
+  font-size: 10px;
+  opacity: 0.7;
+  margin-left: auto;
+}
+
+/* ─── File search ────────────────────────────────── */
+
+.file-search-bar {
+  position: sticky;
+  top: -14px;
+  margin: -14px -14px 12px;
+  padding: 8px 10px;
+  background: rgba(8, 10, 9, 0.97);
+  border-bottom: 1px solid var(--line);
+  z-index: 1;
+}
+
+.file-search-input {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 12px;
+}
+
+.file-search-input:focus {
+  border-color: var(--signal);
+  outline: none;
+}
+
+.file-content-area {
+  min-height: 40px;
+}
+
+/* ─── Search results ─────────────────────────────── */
+
+.search-result-header {
+  padding: 0 0 10px;
+  color: var(--soft);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.search-result {
+  margin-bottom: 10px;
+}
+
+.search-result-file {
+  display: block;
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: rgba(19, 220, 237, 0.06);
+  color: var(--signal);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.search-result-file:hover {
+  background: rgba(19, 220, 237, 0.12);
+}
+
+.search-result-match {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-top: none;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.search-result-match:last-child {
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+}
+
+.match-line {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 10px;
+  color: var(--soft);
+  text-align: right;
+  padding-top: 1px;
+  user-select: none;
+}
+
+.match-text {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── File viewer ────────────────────────────────── */
+
+.file-viewer {
+  margin-top: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.file-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(19, 220, 237, 0.06);
+  border-bottom: 1px solid var(--line);
+}
+
+.file-viewer-path {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--signal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.file-viewer-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.file-viewer-close:hover {
+  color: var(--text);
+}
+
+.file-viewer-content {
+  display: block;
+  margin: 0;
+  padding: 10px;
+  max-height: 300px;
+  overflow: auto;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.28);
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(217, 255, 139, 0.1) transparent;
+}
+
+/* ─── Recently modified files ────────────────────── */
+
+.recent-files-list {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 4px;
+}
+
+.recent-file-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.recent-file-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.recent-file-name {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.recent-file-time {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 10px;
+  color: var(--soft);
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 /* ─── Empty & loading states ─────────────────────── */
