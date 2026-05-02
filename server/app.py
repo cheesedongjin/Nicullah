@@ -24,6 +24,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "4173"))
 MAX_AGENT_STEPS = int(os.environ.get("WARROOM_MAX_AGENT_STEPS", "18"))
 COMMAND_TIMEOUT = int(os.environ.get("WARROOM_COMMAND_TIMEOUT", "90"))
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 
 AGENT_ORDER = ["pm", "designer", "backend", "frontend", "qa"]
 AGENTS = {
@@ -397,29 +398,158 @@ Never invent that a command passed unless you ran it. If a role-specific artifac
 
 
 def extract_json(text: str) -> dict:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+    last_error: json.JSONDecodeError | None = None
+    for candidate in json_candidates(text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            repaired = repair_json_text(candidate)
+            if repaired != candidate:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError as repaired_exc:
+                    last_error = repaired_exc
+    if last_error:
+        raise last_error
+    raise json.JSONDecodeError("No JSON object found", text, 0)
+
+
+def json_candidates(text: str) -> list[str]:
+    stripped = text.strip()
+    candidates: list[str] = []
+    if stripped:
+        candidates.append(stripped)
+
+    candidates.extend(fenced_json_blocks(stripped))
+    candidates.extend(balanced_json_objects(stripped))
+
+    if stripped.startswith("`") and stripped.endswith("`"):
+        candidates.append(stripped.strip("`").strip())
+
+    unique: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def fenced_json_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    for match in re.finditer(r"```(?:json|jsonc)?\s*(.*?)```", text, flags=re.S | re.I):
+        block = match.group(1).strip()
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def balanced_json_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        candidate = first_balanced_json_object(text[index:])
+        if candidate:
+            objects.append(candidate)
+    return objects
+
+
+def first_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = in_string
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text[start:]
+
+
+def repair_json_text(text: str) -> str:
+    repaired = text.strip()
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(r"}\s*{", "},{", repaired)
+    repaired = re.sub(r'([}\]"])\s+("[^"\n\r]+":)', r"\1, \2", repaired)
+    repaired = re.sub(r'([}\]"])\s*\n\s*"', r'\1,\n"', repaired)
+    return repaired
+
+
+def empty_agent_response(reason: str) -> dict:
+    return {
+        "summary": f"Skipped turn because Gemini returned no valid JSON: {reason}",
+        "agent_status": "Skipped invalid Gemini response",
+        "approval_required": None,
+        "actions": [],
+    }
 
 
 def call_agent(root: Path, state: dict, agent_id: str) -> dict:
     client = require_gemini_client()
     handler = GeminiRetryHandler(client)
     context = collect_context(root, state, agent_id)
+    system_instruction = agent_system_instruction(agent_id)
     text = handler.generate_response(
         history=[],
         message=json.dumps(context, ensure_ascii=False),
-        system_instruction=agent_system_instruction(agent_id),
+        system_instruction=system_instruction,
         temperature=0.25,
+        response_mime_type="application/json",
     )
-    return extract_json(text)
+    try:
+        return extract_json(text)
+    except (json.JSONDecodeError, TypeError) as original_error:
+        if not (text or "").strip():
+            retry_text = handler.generate_response(
+                history=[],
+                message=(
+                    "Your previous response was empty. Return exactly one valid JSON object "
+                    "using the required team protocol schema.\n\n"
+                    f"{json.dumps(context, ensure_ascii=False)}"
+                ),
+                system_instruction=system_instruction,
+                temperature=0,
+                response_mime_type="application/json",
+            )
+            try:
+                return extract_json(retry_text)
+            except (json.JSONDecodeError, TypeError) as retry_error:
+                return empty_agent_response(str(retry_error))
+        repaired = handler.generate_response(
+            history=[],
+            message=(
+                "Repair this malformed JSON into one valid JSON object only. "
+                "Preserve all fields and string content. Do not add markdown.\n\n"
+                f"{text}"
+            ),
+            system_instruction="You repair malformed JSON. Return valid JSON only.",
+            temperature=0,
+            response_mime_type="application/json",
+        )
+        try:
+            return extract_json(repaired)
+        except (json.JSONDecodeError, TypeError) as repair_error:
+            return empty_agent_response(str(repair_error or original_error))
 
 
-def run_command(root: Path, command: list[str]) -> dict:
+def resolve_command(root: Path, command: list[str]) -> list[str]:
     if not command or not isinstance(command, list):
         raise ValueError("run_command requires a command array")
     blocked = {"rm", "del", "erase", "rmdir", "rd", "format", "shutdown", "powershell", "cmd"}
@@ -427,13 +557,31 @@ def run_command(root: Path, command: list[str]) -> dict:
     if executable in blocked:
         raise ValueError(f"Command is not allowed: {command[0]}")
     if executable == "python":
-        command = [sys.executable] + [str(item) for item in command[1:]]
-    else:
-        resolved = shutil.which(str(command[0]))
-        if resolved:
-            command = [resolved] + [str(item) for item in command[1:]]
-        else:
-            command = [str(item) for item in command]
+        return [sys.executable] + [str(item) for item in command[1:]]
+
+    raw_executable = str(command[0])
+    resolved = shutil.which(raw_executable)
+    if not resolved and ("/" in raw_executable or "\\" in raw_executable):
+        executable_path = Path(raw_executable)
+        if not executable_path.is_absolute():
+            executable_path = root / executable_path
+        candidates = [executable_path]
+        if os.name == "nt":
+            windows_path = raw_executable.replace("/", "\\")
+            if "\\bin\\" in windows_path:
+                scripts_path = Path(windows_path.replace("\\bin\\", "\\Scripts\\"))
+                if not scripts_path.is_absolute():
+                    scripts_path = root / scripts_path
+                candidates.append(scripts_path)
+            candidates.extend(candidate.with_suffix(".exe") for candidate in list(candidates) if not candidate.suffix)
+        resolved = next((str(candidate) for candidate in candidates if candidate.is_file()), None)
+    if resolved:
+        return [resolved] + [str(item) for item in command[1:]]
+    return [str(item) for item in command]
+
+
+def run_command(root: Path, command: list[str]) -> dict:
+    command = resolve_command(root, command)
     completed = subprocess.run(
         command,
         cwd=str(root),
@@ -892,8 +1040,10 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
                 root = project_root(parts[2])
                 self.write_json(public_state(load_state(root)))
                 return
+        except CLIENT_DISCONNECT_ERRORS:
+            return
         except Exception as exc:
-            self.write_json({"error": str(exc)}, 500)
+            self.write_error_json(exc)
             return
         super().do_GET()
 
@@ -914,9 +1064,11 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
                 return
             self.send_error(404)
         except RuntimeError as exc:
-            self.write_json({"error": str(exc), "gemini_required": True}, 503)
+            self.write_error_json(exc, 503, {"gemini_required": True})
+        except CLIENT_DISCONNECT_ERRORS:
+            return
         except Exception as exc:
-            self.write_json({"error": str(exc)}, 500)
+            self.write_error_json(exc)
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -931,6 +1083,15 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def write_error_json(self, exc: Exception, status: int = 500, extra: dict | None = None) -> None:
+        payload = {"error": str(exc)}
+        if extra:
+            payload.update(extra)
+        try:
+            self.write_json(payload, status)
+        except CLIENT_DISCONNECT_ERRORS:
+            return
 
     def guess_type(self, path: str) -> str:
         if path.endswith(".js"):

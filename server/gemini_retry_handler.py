@@ -28,7 +28,14 @@ class GeminiRetryHandler:
         self.client = client
         self.sleep_func = sleep_func
 
-    def generate_response(self, history, message, system_instruction=None, temperature=None):
+    def generate_response(
+        self,
+        history,
+        message,
+        system_instruction=None,
+        temperature=None,
+        response_mime_type=None,
+    ):
         """
         Attempts to generate a response using the fallback strategy.
 
@@ -51,6 +58,8 @@ class GeminiRetryHandler:
             config_args['system_instruction'] = system_instruction
         if temperature is not None:
             config_args['temperature'] = temperature
+        if response_mime_type:
+            config_args['response_mime_type'] = response_mime_type
 
         config = None
         if config_args:
