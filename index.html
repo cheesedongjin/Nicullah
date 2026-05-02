@@ -36,7 +36,7 @@
 
       <main class="main-screen" aria-label="워룸">
         <header class="room-header">
-          <div>
+          <div class="room-title-group">
             <p class="system-label">STATUS : <span id="projectStatusLabel">STANDBY</span></p>
             <h1 id="projectTitle">AI Agent War Room</h1>
           </div>
@@ -48,60 +48,83 @@
           </div>
         </header>
 
-        <section class="war-room" aria-label="실시간 워룸">
-          <canvas id="thinkGraph" width="1400" height="900" aria-label="에이전트 사고 그래프"></canvas>
+        <div class="content-grid">
+          <!-- 좌측: 캔버스 + 에이전트 카드 -->
+          <div class="canvas-column">
+            <section class="canvas-panel" aria-label="에이전트 사고 그래프">
+              <canvas id="thinkGraph" aria-label="에이전트 사고 그래프"></canvas>
 
-          <div class="graph-overlay">
-            <span>ROOT GOAL</span>
-            <strong id="rootGoalLabel">프로젝트를 생성하면 워룸이 시작됩니다.</strong>
-            <small id="projectDirectoryLabel">no project directory</small>
+              <div class="graph-overlay">
+                <span>ROOT GOAL</span>
+                <strong id="rootGoalLabel">프로젝트를 생성하면 워룸이 시작됩니다.</strong>
+                <small id="projectDirectoryLabel">no project directory</small>
+              </div>
+
+              <div class="backend-lock" id="backendLock" hidden>
+                <strong>Gemini backend required</strong>
+                <span id="backendLockReason"></span>
+              </div>
+            </section>
+
+            <section class="agent-strip" aria-label="에이전트 상태">
+              <article class="agent-card" data-agent="pm">
+                <span class="agent-icon" aria-hidden="true">PM</span>
+                <div class="agent-info">
+                  <h2>PM</h2>
+                  <p id="pmState">대기 중</p>
+                </div>
+              </article>
+              <article class="agent-card" data-agent="designer">
+                <span class="agent-icon" aria-hidden="true">DS</span>
+                <div class="agent-info">
+                  <h2>Designer</h2>
+                  <p id="designerState">대기 중</p>
+                </div>
+              </article>
+              <article class="agent-card" data-agent="backend">
+                <span class="agent-icon" aria-hidden="true">BE</span>
+                <div class="agent-info">
+                  <h2>Backend</h2>
+                  <p id="backendState">대기 중</p>
+                </div>
+              </article>
+              <article class="agent-card" data-agent="frontend">
+                <span class="agent-icon" aria-hidden="true">FE</span>
+                <div class="agent-info">
+                  <h2>Frontend</h2>
+                  <p id="frontendState">대기 중</p>
+                </div>
+              </article>
+              <article class="agent-card" data-agent="qa">
+                <span class="agent-icon" aria-hidden="true">QA</span>
+                <div class="agent-info">
+                  <h2>QA / SET</h2>
+                  <p id="qaState">대기 중</p>
+                </div>
+              </article>
+            </section>
           </div>
 
-          <div class="backend-lock" id="backendLock" hidden>
-            <strong>Gemini backend required</strong>
-            <span id="backendLockReason"></span>
+          <!-- 우측: 정보 패널 -->
+          <div class="info-column">
+            <div class="tab-bar" role="tablist">
+              <button class="tab-btn is-active" data-tab="logs" role="tab" type="button">활동 로그</button>
+              <button class="tab-btn" data-tab="progress" role="tab" type="button">진행 상황</button>
+              <button class="tab-btn" data-tab="files" role="tab" type="button">파일</button>
+            </div>
+            <div class="tab-content">
+              <div class="tab-panel" id="tab-logs" role="tabpanel">
+                <ol class="activity-feed" id="activityFeed" aria-label="에이전트 로그"></ol>
+              </div>
+              <div class="tab-panel" id="tab-progress" role="tabpanel" hidden>
+                <div id="progressPanel"></div>
+              </div>
+              <div class="tab-panel" id="tab-files" role="tabpanel" hidden>
+                <div id="filesPanel"></div>
+              </div>
+            </div>
           </div>
-
-          <section class="agent-strip" aria-label="에이전트 상태">
-            <article class="agent-card" data-agent="pm">
-              <span class="agent-icon" aria-hidden="true">PM</span>
-              <div>
-                <h2>PM</h2>
-                <p id="pmState">대기 중</p>
-              </div>
-            </article>
-            <article class="agent-card" data-agent="designer">
-              <span class="agent-icon" aria-hidden="true">DS</span>
-              <div>
-                <h2>Designer</h2>
-                <p id="designerState">대기 중</p>
-              </div>
-            </article>
-            <article class="agent-card" data-agent="backend">
-              <span class="agent-icon" aria-hidden="true">BE</span>
-              <div>
-                <h2>Backend</h2>
-                <p id="backendState">대기 중</p>
-              </div>
-            </article>
-            <article class="agent-card" data-agent="frontend">
-              <span class="agent-icon" aria-hidden="true">FE</span>
-              <div>
-                <h2>Frontend</h2>
-                <p id="frontendState">대기 중</p>
-              </div>
-            </article>
-            <article class="agent-card" data-agent="qa">
-              <span class="agent-icon" aria-hidden="true">QA</span>
-              <div>
-                <h2>QA / SET</h2>
-                <p id="qaState">대기 중</p>
-              </div>
-            </article>
-          </section>
-
-          <ol class="activity-rail" id="activityFeed" aria-label="에이전트 로그"></ol>
-        </section>
+        </div>
       </main>
     </div>
 
