@@ -31,8 +31,12 @@ class GeminiRetryHandler:
         self.client = client
         self.sleep_func = sleep_func
         self.request_timeout = float(
-            request_timeout or os.environ.get("WARROOM_GEMINI_REQUEST_TIMEOUT", "120")
+            request_timeout or os.environ.get("WARROOM_GEMINI_REQUEST_TIMEOUT", "30")
         )
+        self.primary_retries = int(os.environ.get("WARROOM_GEMINI_PRIMARY_RETRIES", "2"))
+        self.fallback_retries = int(os.environ.get("WARROOM_GEMINI_FALLBACK_RETRIES", "2"))
+        self.rate_wait_min = float(os.environ.get("WARROOM_GEMINI_RATE_WAIT_MIN", "5"))
+        self.rate_wait_max = float(os.environ.get("WARROOM_GEMINI_RATE_WAIT_MAX", "10"))
 
     def generate_response(
         self,
@@ -73,7 +77,7 @@ class GeminiRetryHandler:
 
         for model_index, model_name in enumerate(self.MODELS):
             is_last_model = (model_index == len(self.MODELS) - 1)
-            max_retries = 10 if is_last_model else 5
+            max_retries = self.fallback_retries if is_last_model else self.primary_retries
 
             logger.info(f"Attempting with model: {model_name} (Max retries: {max_retries})")
 
@@ -87,7 +91,7 @@ class GeminiRetryHandler:
                         logger.warning(f"Rate limit hit on {model_name} (Attempt {attempt + 1}/{max_retries})")
 
                         if attempt < max_retries - 1:
-                            wait_time = random.uniform(30, 60)
+                            wait_time = random.uniform(self.rate_wait_min, self.rate_wait_max)
                             logger.info(f"Retrying in {wait_time:.2f}s...")
                             self.sleep_func(wait_time)
                         else:

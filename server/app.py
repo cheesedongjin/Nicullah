@@ -24,7 +24,16 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "4173"))
 MAX_AGENT_STEPS = int(os.environ.get("WARROOM_MAX_AGENT_STEPS", "18"))
 COMMAND_TIMEOUT = int(os.environ.get("WARROOM_COMMAND_TIMEOUT", "90"))
+RUNNER_STALE_SECONDS = int(os.environ.get("WARROOM_RUNNER_STALE_SECONDS", "90"))
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+IGNORED_PROJECT_DIRS = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "coverage", ".next"}
+TICKET_STATUS_ALIASES = {
+    "todo": "ready",
+    "in_progress": "progress",
+    "working": "progress",
+    "needs_review": "review",
+}
+TICKET_STATUSES = {"ready", "progress", "review", "blocked", "done"}
 
 AGENT_ORDER = ["pm", "designer", "backend", "frontend", "qa"]
 AGENTS = {
@@ -127,6 +136,25 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def seconds_since(value: str | None) -> float | None:
+    parsed = parse_timestamp(value)
+    if not parsed:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip().lower()).strip("-")
     return slug[:60] or f"project-{int(time.time())}"
@@ -208,6 +236,12 @@ def normalize_string_list(value) -> list[str]:
     return [str(value)]
 
 
+def normalize_ticket_status(value) -> str:
+    status = str(value or "ready").strip().lower()
+    status = TICKET_STATUS_ALIASES.get(status, status)
+    return status if status in TICKET_STATUSES else "ready"
+
+
 def unresolved_handoff(handoff: dict) -> bool:
     return handoff.get("status") not in {"resolved", "closed"}
 
@@ -229,24 +263,13 @@ def acknowledge_handoffs(state: dict, agent_id: str) -> int:
 def public_state(state: dict) -> dict:
     public = dict(state)
     public["directory"] = str(Path(state["directory"]))
+    public["max_agent_steps"] = MAX_AGENT_STEPS
     return public
 
 
 def _list_dir(directory: str, depth: int = 0) -> list[dict]:
     if not directory or not os.path.isdir(directory) or depth > 4:
         return []
-    collapsed_by_default = {
-        ".git",
-        ".next",
-        ".venv",
-        ".warroom",
-        "__pycache__",
-        "build",
-        "coverage",
-        "dist",
-        "node_modules",
-        "venv",
-    }
     result = []
     try:
         entries = sorted(os.scandir(directory), key=lambda e: (not e.is_dir(), e.name.lower()))
@@ -267,7 +290,7 @@ def _list_dir(directory: str, depth: int = 0) -> list[dict]:
                 "mtime": mtime,
             }
             if entry.is_dir():
-                if entry.name.lower() in collapsed_by_default:
+                if entry.name.lower() in IGNORED_PROJECT_DIRS:
                     node["children"] = []
                 else:
                     node["children"] = _list_dir(entry.path, depth + 1)
@@ -277,15 +300,26 @@ def _list_dir(directory: str, depth: int = 0) -> list[dict]:
     return result
 
 
+def iter_project_paths(root: Path, include_dirs: bool = False):
+    for current, dirs, files in os.walk(root):
+        dirs[:] = sorted(
+            name for name in dirs
+            if name not in IGNORED_PROJECT_DIRS and not (name.startswith(".") and name != ".warroom")
+        )
+        current_path = Path(current)
+        if include_dirs:
+            for dirname in dirs:
+                yield current_path / dirname
+        for filename in sorted(files):
+            yield current_path / filename
+
+
 def recent_files(root: Path, limit: int = 10) -> list[dict]:
-    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
     files = []
-    for path in root.rglob("*"):
+    for path in iter_project_paths(root):
         if path.is_dir():
             continue
         rel = path.relative_to(root)
-        if any(part in ignored for part in rel.parts):
-            continue
         try:
             files.append({"path": str(rel).replace("\\", "/"), "mtime": int(path.stat().st_mtime)})
         except OSError:
@@ -295,17 +329,14 @@ def recent_files(root: Path, limit: int = 10) -> list[dict]:
 
 
 def project_stats(root: Path) -> dict:
-    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
     ext_counts: dict[str, int] = {}
     total_lines = 0
     total_files = 0
     total_size = 0
-    for path in root.rglob("*"):
+    for path in iter_project_paths(root):
         if path.is_dir():
             continue
         rel = path.relative_to(root)
-        if any(part in ignored for part in rel.parts):
-            continue
         total_files += 1
         try:
             stat = path.stat()
@@ -332,18 +363,15 @@ def project_stats(root: Path) -> dict:
 def search_project(root: Path, query: str, max_results: int = 30) -> list[dict]:
     if not query or len(query.strip()) < 2:
         return []
-    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
     try:
         pattern = re.compile(re.escape(query.strip()), re.IGNORECASE)
     except re.error:
         return []
     results = []
-    for path in sorted(root.rglob("*")):
+    for path in iter_project_paths(root):
         if path.is_dir():
             continue
         rel = path.relative_to(root)
-        if any(part in ignored for part in rel.parts):
-            continue
         try:
             if path.stat().st_size > 500_000:
                 continue
@@ -371,7 +399,9 @@ def list_projects() -> list[dict]:
         if not sp.exists():
             continue
         try:
-            projects.append(public_state(json.loads(sp.read_text(encoding="utf-8"))))
+            state = json.loads(sp.read_text(encoding="utf-8"))
+            maybe_recover_or_resume_runner(path, state)
+            projects.append(public_state(load_state(path)))
         except Exception:
             continue
     projects.sort(key=lambda item: item.get("created_at", ""), reverse=True)
@@ -389,11 +419,8 @@ def safe_path(root: Path, relative: str) -> Path:
 
 def project_tree(root: Path, limit: int = 80) -> str:
     lines = []
-    ignored = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
-    for path in sorted(root.rglob("*")):
+    for path in iter_project_paths(root, include_dirs=True):
         rel = path.relative_to(root)
-        if any(part in ignored for part in rel.parts):
-            continue
         lines.append(("/" if path.is_dir() else "") + str(rel).replace("\\", "/"))
         if len(lines) >= limit:
             lines.append("... truncated ...")
@@ -480,7 +507,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
 def agent_system_instruction(agent_id: str) -> str:
     agent = AGENTS[agent_id]
     return f"""
-You are the {agent['role']} in AI Agent War Room.
+You are the {agent['role']} in Nicullah.
 Mission: {agent['mission']}
 
 Work like a real senior programming team member. Continue proactively when the path is clear.
@@ -867,7 +894,7 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                     "id": make_id("ticket"),
                     "title": action.get("title", "Untitled task"),
                     "owner": action.get("owner", agent_id),
-                    "status": action.get("status", "ready"),
+                    "status": normalize_ticket_status(action.get("status")),
                     "priority": action.get("priority", "P2"),
                     "description": action.get("description", ""),
                     "acceptance_criteria": normalize_string_list(action.get("acceptance_criteria")),
@@ -892,7 +919,7 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                     raise ValueError(f"ticket not found: {ticket_id or title}")
                 for key in ("title", "owner", "status", "priority", "description"):
                     if key in action:
-                        ticket[key] = action[key]
+                        ticket[key] = normalize_ticket_status(action[key]) if key == "status" else action[key]
                 for key in ("acceptance_criteria", "depends_on"):
                     if key in action:
                         ticket[key] = normalize_string_list(action.get(key))
@@ -967,7 +994,7 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
     return observations
 
 
-def run_agent_turn(root: Path, state: dict, agent_id: str) -> None:
+def run_agent_turn(root: Path, state: dict, agent_id: str, runner_token: str | None = None) -> None:
     agent = AGENTS[agent_id]
     agent_state = state.setdefault("agents", {}).setdefault(agent_id, {})
     if agent_state.get("blocked"):
@@ -982,10 +1009,15 @@ def run_agent_turn(root: Path, state: dict, agent_id: str) -> None:
     try:
         response = call_agent(root, state, agent_id)
     except Exception as exc:
+        if runner_token and load_state(root).get("runner_token") != runner_token:
+            return
         agent_state["status"] = "error"
         agent_state["message"] = str(exc)[:160]
         append_log(state, agent["label"], f"agent turn failed: {exc}", "error")
         save_state(root, state)
+        return
+
+    if runner_token and load_state(root).get("runner_token") != runner_token:
         return
 
     agent_state["message"] = response.get("agent_status") or response.get("summary") or "Updated"
@@ -1015,11 +1047,14 @@ def run_agent_turn(root: Path, state: dict, agent_id: str) -> None:
     save_state(root, state)
 
 
-def run_project_loop(project_id: str) -> None:
+def run_project_loop(project_id: str, runner_token: str) -> None:
     root = project_root(project_id)
     try:
         for _ in range(MAX_AGENT_STEPS):
             state = load_state(root)
+            if state.get("runner_token") not in {None, runner_token}:
+                return
+            state["runner_token"] = runner_token
             state["running"] = True
             state["status"] = "running"
             state["iteration"] = state.get("iteration", 0) + 1
@@ -1037,34 +1072,94 @@ def run_project_loop(project_id: str) -> None:
 
             for agent_id in AGENT_ORDER:
                 state = load_state(root)
+                if state.get("runner_token") != runner_token:
+                    return
                 if state.get("agents", {}).get(agent_id, {}).get("blocked"):
                     continue
-                run_agent_turn(root, state, agent_id)
+                run_agent_turn(root, state, agent_id, runner_token)
                 time.sleep(0.2)
 
             state = load_state(root)
+            if state.get("runner_token") != runner_token:
+                return
             if state.get("status") == "complete":
                 break
             if state.get("pending_decisions"):
                 state["status"] = "waiting_for_approval"
             save_state(root, state)
             time.sleep(0.5)
+        else:
+            state = load_state(root)
+            if state.get("runner_token") == runner_token and state.get("status") == "running":
+                state["status"] = "waiting_for_handoff"
+                append_log(
+                    state,
+                    "System",
+                    f"Agent loop paused after {MAX_AGENT_STEPS} steps. Resume when you want another pass.",
+                )
+                save_state(root, state)
     except Exception as exc:
         state = load_state(root)
+        if state.get("runner_token") != runner_token:
+            return
         state["status"] = "error"
         append_log(state, "System", str(exc), "error")
         save_state(root, state)
     finally:
         state = load_state(root)
-        state["running"] = False
-        save_state(root, state)
+        if state.get("runner_token") == runner_token:
+            state["running"] = False
+            state["runner_token"] = None
+            save_state(root, state)
 
 
-def ensure_runner(project_id: str) -> None:
+def runner_thread_alive(project_id: str) -> bool:
     thread = runner_threads.get(project_id)
-    if thread and thread.is_alive():
+    return bool(thread and thread.is_alive())
+
+
+def mark_stale_runner_recovered(root: Path, state: dict, age: float | None, resume: bool = True) -> None:
+    stale_agents = []
+    for agent_id, agent_state in state.get("agents", {}).items():
+        if agent_state.get("status") == "running":
+            stale_agents.append(agent_id)
+            agent_state["status"] = "idle"
+            agent_state["message"] = "Recovered stalled turn; retrying"
+            agent_state["updated_at"] = now()
+
+    state["running"] = False
+    if resume:
+        state["status"] = "running"
+    state["runner_token"] = None
+    detail = f"{int(age)}s" if age is not None else "unknown duration"
+    names = ", ".join(stale_agents) if stale_agents else "project"
+    append_log(state, "System", f"Recovered stale runner state for {names} after {detail}.", "warning")
+    save_state(root, state)
+
+
+def maybe_recover_or_resume_runner(root: Path, state: dict) -> None:
+    project_id = state.get("id")
+    if not project_id or state.get("pending_decisions"):
         return
-    thread = threading.Thread(target=run_project_loop, args=(project_id,), daemon=True)
+
+    age = seconds_since(state.get("updated_at"))
+    thread_alive = runner_thread_alive(project_id)
+    stale = bool(state.get("running")) and (not thread_alive or age is None or age > RUNNER_STALE_SECONDS)
+    if stale:
+        should_resume = state.get("status") == "running"
+        mark_stale_runner_recovered(root, state, age, resume=should_resume)
+        if should_resume:
+            ensure_runner(project_id, force=True)
+    elif state.get("status") == "running" and not state.get("running") and not thread_alive:
+        ensure_runner(project_id)
+
+
+def ensure_runner(project_id: str, force: bool = False) -> None:
+    thread = runner_threads.get(project_id)
+    if thread and thread.is_alive() and not force:
+        return
+    runner_token = make_id("runner")
+    thread = threading.Thread(target=run_project_loop, args=(project_id, runner_token), daemon=True)
     runner_threads[project_id] = thread
     thread.start()
 
@@ -1217,6 +1312,8 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
                 return
             if len(parts) == 3 and parts[:2] == ["api", "projects"]:
                 root = project_root(parts[2])
+                state_data = load_state(root)
+                maybe_recover_or_resume_runner(root, state_data)
                 self.write_json(public_state(load_state(root)))
                 return
             if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "files":
@@ -1308,7 +1405,7 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
 def main() -> None:
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((HOST, PORT), WarRoomHandler)
-    print(f"AI Agent War Room running at http://{HOST}:{PORT}")
+    print(f"Nicullah running at http://{HOST}:{PORT}")
     print(f"Project directories: {PROJECTS_DIR}")
     print("Gemini is required. Set GEMINI_API_KEY and install google-genai.")
     server.serve_forever()

@@ -2,7 +2,7 @@
   "name": "ai-agent-war-room",
   "version": "1.0.0",
   "private": true,
-  "description": "AI Agent War Room command center prototype for PO-led autonomous agent workflows.",
+  "description": "Nicullah command center prototype for PO-led autonomous agent workflows.",
   "scripts": {
     "start": "python server/app.py",
     "serve": "python server/app.py"

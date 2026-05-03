@@ -690,6 +690,7 @@ h1 {
 
 .badge-done     { background: rgba(217, 255, 139, 0.1);  color: var(--accent); }
 .badge-progress { background: rgba(19, 220, 237, 0.1);   color: var(--signal); }
+.badge-review   { background: rgba(255, 209, 102, 0.1);  color: #ffd166;      }
 .badge-blocked  { background: rgba(255, 77, 84, 0.1);    color: var(--warn);   }
 .badge-todo     { background: rgba(255, 255, 255, 0.05); color: var(--soft);   }
 
@@ -716,10 +717,17 @@ h1 {
   flex: 0 0 auto;
 }
 
-.ticket-item[data-status="done"]        .ticket-dot { background: var(--accent); }
-.ticket-item[data-status="in_progress"] .ticket-dot { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
-.ticket-item[data-status="blocked"]     .ticket-dot { background: var(--warn); }
-.ticket-item[data-status="todo"]        .ticket-dot { background: var(--soft); }
+.ticket-item[data-status="done"]     .ticket-dot { background: var(--accent); }
+.ticket-item[data-status="progress"] .ticket-dot { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
+.ticket-item[data-status="review"]   .ticket-dot { background: #ffd166; }
+.ticket-item[data-status="blocked"]  .ticket-dot { background: var(--warn); }
+.ticket-item[data-status="ready"]    .ticket-dot { background: var(--soft); }
+
+.ticket-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
 
 .ticket-name {
   font-size: 12px;
@@ -727,6 +735,15 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ticket-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--muted);
 }
 
 .ticket-owner-tag {

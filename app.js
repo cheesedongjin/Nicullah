@@ -150,6 +150,7 @@ function statusLabel(status) {
   const map = {
     created: "생성됨",
     running: "실행 중",
+    waiting_for_handoff: "대기 중",
     waiting_for_approval: "승인 대기",
     complete: "완료",
     error: "오류",
@@ -161,7 +162,7 @@ function renderWarRoom() {
   const project = activeProject();
   const pending = project?.pending_decisions?.[0] || null;
 
-  $("#projectTitle").textContent = project?.name || "AI Agent War Room";
+  $("#projectTitle").textContent = project?.name || "Nicullah";
   $("#projectStatusLabel").textContent = project?.status?.toUpperCase() || "STANDBY";
   $("#rootGoalLabel").textContent = project?.vision || "프로젝트를 생성하면 워룸이 시작됩니다.";
   $("#projectDirectoryLabel").textContent = project ? shortPath(project.directory) : "no project directory";
@@ -181,6 +182,24 @@ function renderWarRoom() {
   if (state.activeTab === "files") renderFiles(project);
 
   drawGraph(Boolean(project), project?.iteration || 0);
+}
+
+function ticketStatusKey(status) {
+  const key = String(status || "ready").toLowerCase();
+  return {
+    todo: "ready",
+    in_progress: "progress",
+    working: "progress",
+    needs_review: "review",
+  }[key] || key;
+}
+
+function ticketDetail(ticket) {
+  const notes = Array.isArray(ticket.notes) ? ticket.notes.filter(Boolean) : [];
+  const detail = notes.at(-1) || ticket.description || "";
+  return detail
+    ? `<span class="ticket-detail">${escapeHtml(detail)}</span>`
+    : "";
 }
 
 function setAgent(id, data) {
@@ -223,15 +242,18 @@ function renderProgress(project) {
   }
 
   const iteration = project.iteration || 0;
-  const maxIter = 18;
-  const pct = Math.round((iteration / maxIter) * 100);
+  const maxIter = project.max_agent_steps || 18;
+  const displayedIteration = Math.min(iteration, maxIter);
+  const pct = Math.min(100, Math.round((displayedIteration / maxIter) * 100));
   const tickets = project.tickets || [];
   const handoffs = (project.handoffs || []).filter((h) => h.status === "open").slice(0, 5);
 
-  const done = tickets.filter((t) => t.status === "done").length;
-  const inProg = tickets.filter((t) => t.status === "in_progress").length;
-  const blocked = tickets.filter((t) => t.status === "blocked").length;
-  const todo = tickets.filter((t) => t.status === "todo").length;
+  const count = (status) => tickets.filter((t) => ticketStatusKey(t.status) === status).length;
+  const done = count("done");
+  const inProg = count("progress");
+  const review = count("review");
+  const blocked = count("blocked");
+  const ready = count("ready");
 
   panel.innerHTML = `
     <div class="progress-section">
@@ -240,7 +262,7 @@ function renderProgress(project) {
         <div class="iteration-fill" style="width:${pct}%"></div>
       </div>
       <div class="iteration-label">
-        <span>Step ${iteration} / ${maxIter}</span>
+        <span>Step ${displayedIteration} / ${maxIter}</span>
         <span>${pct}%</span>
       </div>
     </div>
@@ -251,17 +273,21 @@ function renderProgress(project) {
         tickets.length
           ? `<div class="ticket-stats">
           ${done ? `<span class="badge badge-done">✓ ${done} 완료</span>` : ""}
-          ${inProg ? `<span class="badge badge-progress">▶ ${inProg} 진행중</span>` : ""}
+          ${inProg ? `<span class="badge badge-progress">↻ ${inProg} 진행중</span>` : ""}
+          ${review ? `<span class="badge badge-review">◌ ${review} 리뷰</span>` : ""}
           ${blocked ? `<span class="badge badge-blocked">✗ ${blocked} 블록됨</span>` : ""}
-          ${todo ? `<span class="badge badge-todo">◦ ${todo} 대기</span>` : ""}
+          ${ready ? `<span class="badge badge-todo">… ${ready} 대기</span>` : ""}
         </div>
         <div class="ticket-list">
           ${tickets
             .map(
               (t) => `
-            <div class="ticket-item" data-status="${t.status}">
+            <div class="ticket-item" data-status="${ticketStatusKey(t.status)}">
               <span class="ticket-dot"></span>
-              <span class="ticket-name">${escapeHtml(t.title)}</span>
+              <span class="ticket-copy">
+                <span class="ticket-name">${escapeHtml(t.title)}</span>
+                ${ticketDetail(t)}
+              </span>
               <span class="ticket-owner-tag">${t.owner || ""}</span>
             </div>`,
             )
@@ -299,7 +325,9 @@ function renderProgress(project) {
             (d) => `
           <div class="ticket-item" data-status="blocked">
             <span class="ticket-dot"></span>
-            <span class="ticket-name">${escapeHtml(d.question || "승인 필요")}</span>
+            <span class="ticket-copy">
+              <span class="ticket-name">${escapeHtml(d.question || "승인 필요")}</span>
+            </span>
             <span class="ticket-owner-tag">${d.agent || ""}</span>
           </div>`,
           )

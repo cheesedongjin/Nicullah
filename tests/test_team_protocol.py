@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -110,6 +111,80 @@ Use this:
         self.assertIsNone(payload["approval_required"])
         self.assertEqual(payload["actions"], [])
 
+    def test_stale_runner_state_is_recovered_and_resumed(self):
+        root = ROOT / "demo"
+        state = {
+            "id": "project-demo",
+            "status": "running",
+            "running": True,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "pending_decisions": [],
+            "agents": {
+                "frontend": {
+                    "status": "running",
+                    "message": "Working",
+                    "blocked": False,
+                }
+            },
+            "logs": [],
+        }
+
+        with patch("app.runner_thread_alive", return_value=False), patch("app.save_state") as save_state, patch(
+            "app.ensure_runner"
+        ) as ensure_runner:
+            app.maybe_recover_or_resume_runner(root, state)
+
+        self.assertFalse(state["running"])
+        self.assertEqual(state["agents"]["frontend"]["status"], "idle")
+        self.assertIn("Recovered stale runner state", state["logs"][-1]["message"])
+        save_state.assert_called_once_with(root, state)
+        ensure_runner.assert_called_once_with("project-demo", force=True)
+
+    def test_stale_paused_runner_is_recovered_without_resuming(self):
+        root = ROOT / "demo"
+        state = {
+            "id": "project-demo",
+            "status": "waiting_for_handoff",
+            "running": True,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "pending_decisions": [],
+            "agents": {
+                "frontend": {
+                    "status": "running",
+                    "message": "Working",
+                    "blocked": False,
+                }
+            },
+            "logs": [],
+        }
+
+        with patch("app.runner_thread_alive", return_value=False), patch("app.save_state") as save_state, patch(
+            "app.ensure_runner"
+        ) as ensure_runner:
+            app.maybe_recover_or_resume_runner(root, state)
+
+        self.assertFalse(state["running"])
+        self.assertEqual(state["status"], "waiting_for_handoff")
+        self.assertEqual(state["agents"]["frontend"]["status"], "idle")
+        save_state.assert_called_once_with(root, state)
+        ensure_runner.assert_not_called()
+
+    def test_ticket_status_aliases_are_normalized(self):
+        state = {"tickets": [], "handoffs": [], "reviews": [], "logs": []}
+
+        app.execute_actions(
+            ROOT,
+            state,
+            "pm",
+            [
+                {"type": "add_ticket", "title": "Old todo", "status": "todo"},
+                {"type": "add_ticket", "title": "Old progress", "status": "in_progress"},
+            ],
+        )
+
+        self.assertEqual(state["tickets"][0]["status"], "ready")
+        self.assertEqual(state["tickets"][1]["status"], "progress")
+
     def test_resolve_command_maps_unix_venv_path_on_windows(self):
         root = ROOT / "demo"
         expected = str(root / "backend" / "venv" / "Scripts" / "pip.exe")
@@ -197,6 +272,21 @@ Use this:
         self.assertIn("README.md", context["file_excerpts"])
         self.assertIn("record_review", context["allowed_actions"])
         self.assertEqual(context["previews"][0]["review"], "layout ok")
+
+    def test_project_tree_prunes_dependency_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "App.jsx").write_text("export default function App() {}", encoding="utf-8")
+            (root / "node_modules" / "huge-package").mkdir(parents=True)
+            (root / "node_modules" / "huge-package" / "index.js").write_text("ignored", encoding="utf-8")
+
+            tree = app.project_tree(root)
+            stats = app.project_stats(root)
+
+        self.assertIn("src/App.jsx", tree)
+        self.assertNotIn("node_modules", tree)
+        self.assertEqual(stats["total_files"], 1)
 
 
 if __name__ == "__main__":
