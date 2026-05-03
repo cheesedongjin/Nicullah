@@ -1982,6 +1982,13 @@ def run_agent_turn(root: Path, state: dict, agent_id: str, runner_token: str | N
     except Exception as exc:
         if runner_token and load_state(root).get("runner_token") != runner_token:
             return
+        if GeminiRetryHandler.is_retryable_exception(exc):
+            agent_state["status"] = "idle"
+            agent_state["message"] = f"Gemini temporarily unavailable; will retry ({str(exc)[:96]})"
+            agent_state["updated_at"] = now()
+            append_log(state, agent["label"], f"agent turn deferred: {exc}", "warning")
+            save_state(root, state)
+            return
         agent_state["status"] = "error"
         agent_state["message"] = str(exc)[:160]
         append_log(state, agent["label"], f"agent turn failed: {exc}", "error")
@@ -2363,8 +2370,12 @@ def send_po_message(project_id: str, payload: dict) -> dict:
     state = load_state(root)
 
     chat_result = None
+    chat_classification_error = None
     if po_message_chat_candidate(message):
-        chat_result = classify_pm_chat_message(root, state, message)
+        try:
+            chat_result = classify_pm_chat_message(root, state, message)
+        except Exception as exc:
+            chat_classification_error = exc
 
     entry = {
         "id": make_id("po-message"),
@@ -2376,6 +2387,13 @@ def send_po_message(project_id: str, payload: dict) -> dict:
     }
     state.setdefault("po_messages", []).append(entry)
     state["po_messages"] = state["po_messages"][-100:]
+    if chat_classification_error:
+        append_log(
+            state,
+            "PM",
+            f"PM chat classification unavailable; queued message for PM work turn: {chat_classification_error}",
+            "warning",
+        )
 
     if chat_result and chat_result.get("mode") == "chat":
         append_log(state, "PO", message, "po_message")

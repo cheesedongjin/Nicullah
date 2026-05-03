@@ -26,17 +26,36 @@ class GeminiRetryHandler:
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite"
     ]
+    TRANSIENT_ERROR_SNIPPETS = (
+        "timed out",
+        "timeout",
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote protocol",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "503",
+        "502",
+        "504",
+    )
 
     def __init__(self, client, sleep_func=time.sleep, request_timeout=None):
         self.client = client
         self.sleep_func = sleep_func
         self.request_timeout = float(
-            request_timeout or os.environ.get("WARROOM_GEMINI_REQUEST_TIMEOUT", "30")
+            request_timeout or os.environ.get("WARROOM_GEMINI_REQUEST_TIMEOUT", "45")
         )
-        self.primary_retries = int(os.environ.get("WARROOM_GEMINI_PRIMARY_RETRIES", "2"))
+        self.primary_retries = int(os.environ.get("WARROOM_GEMINI_PRIMARY_RETRIES", "1"))
         self.fallback_retries = int(os.environ.get("WARROOM_GEMINI_FALLBACK_RETRIES", "2"))
         self.rate_wait_min = float(os.environ.get("WARROOM_GEMINI_RATE_WAIT_MIN", "5"))
         self.rate_wait_max = float(os.environ.get("WARROOM_GEMINI_RATE_WAIT_MAX", "10"))
+        self.transient_wait_min = float(os.environ.get("WARROOM_GEMINI_TRANSIENT_WAIT_MIN", "0.5"))
+        self.transient_wait_max = float(os.environ.get("WARROOM_GEMINI_TRANSIENT_WAIT_MAX", "1.5"))
 
     def generate_response(
         self,
@@ -87,18 +106,24 @@ class GeminiRetryHandler:
 
                 except Exception as e:
                     last_exception = e
-                    if self._is_rate_limit_error(e):
-                        logger.warning(f"Rate limit hit on {model_name} (Attempt {attempt + 1}/{max_retries})")
-
-                        if attempt < max_retries - 1:
-                            wait_time = random.uniform(self.rate_wait_min, self.rate_wait_max)
-                            logger.info(f"Retrying in {wait_time:.2f}s...")
-                            self.sleep_func(wait_time)
-                        else:
-                            logger.warning(f"Exhausted retries for {model_name}")
-                    else:
+                    is_rate_limit = self._is_rate_limit_error(e)
+                    is_transient = self._is_transient_error(e)
+                    if not (is_rate_limit or is_transient):
                         logger.error(f"Non-retriable error on {model_name}: {e}")
                         raise e
+
+                    error_kind = "Rate limit" if is_rate_limit else "Transient Gemini error"
+                    logger.warning(f"{error_kind} on {model_name} (Attempt {attempt + 1}/{max_retries}): {e}")
+
+                    if attempt < max_retries - 1:
+                        if is_rate_limit:
+                            wait_time = random.uniform(self.rate_wait_min, self.rate_wait_max)
+                        else:
+                            wait_time = random.uniform(self.transient_wait_min, self.transient_wait_max)
+                        logger.info(f"Retrying in {wait_time:.2f}s...")
+                        self.sleep_func(wait_time)
+                    else:
+                        logger.warning(f"Exhausted retries for {model_name}")
 
             if model_index < len(self.MODELS) - 1:
                 switch_wait = random.uniform(2, 4)
@@ -110,7 +135,12 @@ class GeminiRetryHandler:
             raise last_exception
         raise Exception("Failed to generate response after all attempts.")
 
-    def _is_rate_limit_error(self, exception):
+    @classmethod
+    def is_retryable_exception(cls, exception):
+        return cls._is_rate_limit_error(exception) or cls._is_transient_error(exception)
+
+    @staticmethod
+    def _is_rate_limit_error(exception):
         """Checks if the exception is a 429 Rate Limit error."""
         if hasattr(exception, 'status') and exception.status == 429:
             return True
@@ -120,6 +150,19 @@ class GeminiRetryHandler:
         if "429" in msg or "quota" in msg or "rate limit" in msg:
             return True
         return False
+
+    @classmethod
+    def _is_transient_error(cls, exception):
+        """Checks for temporary transport/server errors worth retrying or deferring."""
+        if isinstance(exception, TimeoutError):
+            return True
+        if isinstance(exception, (ConnectionError, OSError)):
+            return True
+        status = getattr(exception, "status", None) or getattr(exception, "code", None)
+        if status in {500, 502, 503, 504}:
+            return True
+        msg = str(exception).lower()
+        return any(snippet in msg for snippet in cls.TRANSIENT_ERROR_SNIPPETS)
 
     def _send_message_with_timeout(self, model_name, history, config, message):
         result_queue = queue.Queue(maxsize=1)

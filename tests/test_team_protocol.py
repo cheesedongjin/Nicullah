@@ -51,6 +51,67 @@ class TeamProtocolTests(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_gemini_timeout_falls_back_to_next_model(self):
+        attempted_models = []
+
+        class ModelAwareChat:
+            def __init__(self, model):
+                self.model = model
+
+            def send_message(self, message):
+                if self.model == "gemini-2.5-flash":
+                    time.sleep(1)
+                return type("Response", (), {"text": f'{{"model":"{self.model}"}}'})()
+
+        class ModelAwareClient:
+            class Chats:
+                def create(self, **kwargs):
+                    attempted_models.append(kwargs["model"])
+                    return ModelAwareChat(kwargs["model"])
+
+            chats = Chats()
+
+        handler = GeminiRetryHandler(
+            ModelAwareClient(),
+            sleep_func=lambda _: None,
+            request_timeout=0.01,
+        )
+
+        response = handler.generate_response(history=[], message="{}", system_instruction="test")
+
+        self.assertEqual(response, '{"model":"gemini-2.5-flash-lite"}')
+        self.assertIn("gemini-2.5-flash", attempted_models)
+        self.assertIn("gemini-2.5-flash-lite", attempted_models)
+
+    def test_gemini_server_disconnect_is_retried(self):
+        calls = {"count": 0}
+
+        class FlakyChat:
+            def send_message(self, message):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise RuntimeError("Server disconnected without sending a response.")
+                return type("Response", (), {"text": '{"ok":true}'})()
+
+        class FlakyClient:
+            class Chats:
+                def create(self, **kwargs):
+                    return FlakyChat()
+
+            chats = Chats()
+
+        handler = GeminiRetryHandler(
+            FlakyClient(),
+            sleep_func=lambda _: None,
+            request_timeout=0.5,
+        )
+        handler.primary_retries = 2
+
+        response = handler.generate_response(history=[], message="{}", system_instruction="test")
+
+        self.assertEqual(response, '{"ok":true}')
+        self.assertEqual(calls["count"], 2)
+
     def test_extract_json_accepts_fenced_json_and_trailing_commas(self):
         payload = app.extract_json(
             """```json
@@ -180,6 +241,46 @@ Use this:
         self.assertEqual(state["agents"]["frontend"]["status"], "idle")
         save_state.assert_called_once_with(root, state)
         ensure_runner.assert_not_called()
+
+    def test_run_agent_turn_defers_transient_gemini_failure(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir()
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Demo",
+                "status": "running",
+                "running": True,
+                "agents": {
+                    "pm": {
+                        "label": "PM",
+                        "role": "Product Manager",
+                        "status": "idle",
+                        "message": "Ready",
+                        "blocked": False,
+                    }
+                },
+                "logs": [],
+                "handoffs": [],
+                "tickets": [],
+                "pending_decisions": [],
+            }
+            app.save_state(root, state)
+
+            with patch(
+                "app.call_agent",
+                side_effect=TimeoutError("Gemini request timed out after 45s on gemini-2.5-flash"),
+            ):
+                app.run_agent_turn(root, app.load_state(root), "pm")
+
+            final_state = app.load_state(root)
+            self.assertEqual(final_state["agents"]["pm"]["status"], "idle")
+            self.assertIn("Gemini temporarily unavailable", final_state["agents"]["pm"]["message"])
+            self.assertTrue(any(
+                "agent turn deferred" in item["message"] and item["level"] == "warning"
+                for item in final_state["logs"]
+            ))
 
     def test_ticket_status_aliases_are_normalized(self):
         state = {"tickets": [], "handoffs": [], "reviews": [], "logs": []}
@@ -766,6 +867,41 @@ Use this:
         self.assertEqual(public["pm_chat"][1]["message"], "The project is currently stopped.")
         self.assertEqual(public["agents"]["pm"]["message"], "Answered status question")
         ensure_runner.assert_not_called()
+
+    def test_po_message_queues_when_chat_classification_disconnects(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "stopped",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "pm_chat": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root), patch("app.ensure_runner") as ensure_runner, patch(
+                "app.classify_pm_chat_message",
+                side_effect=RuntimeError("Server disconnected without sending a response."),
+            ):
+                public = app.send_po_message("project-demo", {"message": "What is the current status?"})
+
+        self.assertEqual(public["status"], "running")
+        self.assertEqual(public["po_messages"][0]["status"], "open")
+        self.assertEqual(public["handoffs"][0]["to"], "pm")
+        self.assertTrue(any(
+            "PM chat classification unavailable" in item["message"] and item["level"] == "warning"
+            for item in public["logs"]
+        ))
+        ensure_runner.assert_called_once_with("project-demo")
 
     def test_reply_to_po_action_records_chat_memory(self):
         state = {
