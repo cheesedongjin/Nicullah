@@ -253,6 +253,65 @@ Use this:
         self.assertEqual(app.acknowledge_handoffs(state, "frontend"), 2)
         self.assertTrue(all(item["status"] == "received" for item in state["handoffs"]))
 
+    def test_set_status_complete_is_ignored_with_unfinished_work(self):
+        state = {
+            "status": "running",
+            "tickets": [{"id": "T1", "title": "Fix API", "status": "progress"}],
+            "handoffs": [],
+            "pending_decisions": [],
+            "po_messages": [],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "designer",
+            [{"type": "set_status", "status": "complete"}],
+        )
+
+        self.assertEqual(state["status"], "running")
+        self.assertIn("ignored complete project status with unfinished work: 1 open ticket(s)", observations)
+
+    def test_set_status_complete_is_allowed_when_project_has_no_blockers(self):
+        state = {
+            "status": "running",
+            "tickets": [{"id": "T1", "title": "Fix API", "status": "done"}],
+            "handoffs": [{"id": "H1", "status": "resolved"}],
+            "pending_decisions": [],
+            "po_messages": [{"id": "P1", "status": "handled"}],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "pm",
+            [{"type": "set_status", "status": "complete"}],
+        )
+
+        self.assertEqual(state["status"], "complete")
+        self.assertIn("status set to complete", observations)
+
+    def test_agent_level_wait_status_keeps_project_running(self):
+        state = {
+            "status": "running",
+            "tickets": [],
+            "handoffs": [],
+            "pending_decisions": [],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "qa",
+            [{"type": "set_status", "status": "waiting_for_agent"}],
+        )
+
+        self.assertEqual(state["status"], "running")
+        self.assertIn("kept project running; waiting_for_agent is an agent-level status", observations)
+
     def test_edit_file_allows_indentation_normalized_match(self):
         with workspace_tempdir() as tmp:
             root = Path(tmp)
@@ -307,6 +366,132 @@ Use this:
             self.assertIn("L1: def service():", observations[0])
             self.assertIn("Read the file or search for a stable anchor", observations[0])
             self.assertEqual(target.read_text(encoding="utf-8"), "def service():\n    return 'current'\n")
+            self.assertEqual(state["logs"][-1]["level"], "error")
+
+    def test_edit_file_treats_already_applied_replacement_as_noop(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            target = root / "docs" / "backlog.md"
+            target.parent.mkdir(parents=True)
+            current = (
+                "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                "  * **Status:** Done\n"
+                "  * **Notes:** Resolved by Frontend.\n"
+            )
+            target.write_text(current, encoding="utf-8")
+            state = {"logs": []}
+
+            observations = app.execute_actions(
+                root,
+                state,
+                "pm",
+                [
+                    {
+                        "type": "edit_file",
+                        "path": "docs/backlog.md",
+                        "find": (
+                            "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                            "  * **Status:** Ready\n"
+                            "  * **Notes:** Resolved by Frontend.\n"
+                        ),
+                        "replace": current,
+                    }
+                ],
+            )
+
+            self.assertIn("edit skipped docs/backlog.md (already applied)", observations)
+            self.assertEqual(target.read_text(encoding="utf-8"), current)
+            self.assertEqual(state["logs"], [])
+
+    def test_edit_file_uses_unique_fuzzy_window_for_stale_multiline_anchor(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            target = root / "docs" / "backlog.md"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                "  * **Owner:** frontend\n"
+                "  * **Priority:** P3\n"
+                "  * **Status:** Done\n"
+                "  * **Description:** Buttons are inconsistently spaced.\n"
+                "  * **Acceptance Criteria:**\n"
+                "    * Buttons use consistent spacing.\n",
+                encoding="utf-8",
+            )
+            replacement = (
+                "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                "  * **Owner:** frontend\n"
+                "  * **Priority:** P3\n"
+                "  * **Status:** Done\n"
+                "  * **Description:** Buttons are inconsistently spaced.\n"
+                "  * **Acceptance Criteria:**\n"
+                "    * Buttons use consistent spacing.\n"
+                "  * **Notes:** Resolved by Frontend.\n"
+            )
+
+            observations = app.execute_actions(
+                root,
+                {"logs": []},
+                "pm",
+                [
+                    {
+                        "type": "edit_file",
+                        "path": "docs/backlog.md",
+                        "find": (
+                            "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                            "  * **Owner:** frontend\n"
+                            "  * **Priority:** P3\n"
+                            "  * **Status:** Ready\n"
+                            "  * **Description:** Buttons are inconsistently spaced.\n"
+                            "  * **Acceptance Criteria:**\n"
+                            "    * Buttons use consistent spacing.\n"
+                        ),
+                        "replace": replacement,
+                    }
+                ],
+            )
+
+            self.assertIn("edited docs/backlog.md (fuzzy-line-window match)", observations)
+            self.assertEqual(target.read_text(encoding="utf-8"), replacement)
+
+    def test_edit_file_rejects_ambiguous_fuzzy_window(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            target = root / "docs" / "backlog.md"
+            target.parent.mkdir(parents=True)
+            block = (
+                "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                "  * **Owner:** frontend\n"
+                "  * **Priority:** P3\n"
+                "  * **Status:** Done\n"
+                "  * **Description:** Buttons are inconsistently spaced.\n"
+            )
+            target.write_text(block + "\n" + block, encoding="utf-8")
+            original = target.read_text(encoding="utf-8")
+            state = {"logs": []}
+
+            observations = app.execute_actions(
+                root,
+                state,
+                "pm",
+                [
+                    {
+                        "type": "edit_file",
+                        "path": "docs/backlog.md",
+                        "find": (
+                            "* **Ticket:** `ticket-ui-spacing` - **Spacing**\n"
+                            "  * **Owner:** frontend\n"
+                            "  * **Priority:** P3\n"
+                            "  * **Status:** Ready\n"
+                            "  * **Description:** Buttons are inconsistently spaced.\n"
+                        ),
+                        "replace": block + "  * **Notes:** Resolved by Frontend.\n",
+                    }
+                ],
+            )
+
+            self.assertIn("edit_file failed: find text matched multiple fuzzy locations", observations[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
             self.assertEqual(state["logs"][-1]["level"], "error")
 
     def test_request_po_approval_action_blocks_only_requesting_agent(self):

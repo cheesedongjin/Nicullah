@@ -201,6 +201,22 @@ svg {
   background: rgba(217, 255, 139, 0.06);
 }
 
+.project-item[data-status="complete"] {
+  border-color: rgba(217, 255, 139, 0.42);
+  background: rgba(217, 255, 139, 0.09);
+}
+
+.project-item[data-status="complete"] .project-glyph {
+  border-color: rgba(217, 255, 139, 0.55);
+  background: rgba(217, 255, 139, 0.12);
+  box-shadow: 0 0 14px rgba(217, 255, 139, 0.18);
+}
+
+.project-item[data-status="complete"] small {
+  color: var(--accent);
+  font-weight: 700;
+}
+
 .project-glyph {
   display: grid;
   place-items: center;
@@ -267,7 +283,7 @@ svg {
 
 .main-screen {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto 1fr;
   min-width: 0;
   min-height: 0;
   padding: 18px;
@@ -325,6 +341,70 @@ h1 {
 
 .stop-resume-button {
   white-space: nowrap;
+}
+
+.completion-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(217, 255, 139, 0.48);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(90deg, rgba(217, 255, 139, 0.15), rgba(19, 220, 237, 0.08)),
+    rgba(8, 10, 9, 0.96);
+  box-shadow: 0 0 0 1px rgba(217, 255, 139, 0.06), 0 12px 30px rgba(0, 0, 0, 0.25);
+}
+
+.completion-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.completion-kicker {
+  color: var(--signal);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.completion-copy strong {
+  color: var(--accent);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.completion-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.completion-seal {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  border: 1px solid rgba(217, 255, 139, 0.48);
+  border-radius: 50%;
+  color: #091006;
+  background: var(--accent);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  font-weight: 800;
+  box-shadow: 0 0 24px rgba(217, 255, 139, 0.28);
+}
+
+.main-screen.is-complete-project #projectStatusLabel {
+  color: var(--accent);
+  text-shadow: 0 0 12px rgba(217, 255, 139, 0.32);
 }
 
 /* ─── Content grid ───────────────────────────────── */
@@ -713,6 +793,31 @@ h1 {
 
 .progress-section:last-child {
   margin-bottom: 0;
+}
+
+.completion-summary {
+  padding: 14px;
+  border: 1px solid rgba(217, 255, 139, 0.4);
+  border-radius: var(--radius-sm);
+  background: rgba(217, 255, 139, 0.08);
+}
+
+.completion-summary strong,
+.completion-summary span {
+  display: block;
+}
+
+.completion-summary strong {
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.completion-summary span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .section-title {
@@ -1507,6 +1612,16 @@ input[type="color"] {
   .stop-resume-button,
   #openDecisionButton {
     flex: 1 1 auto;
+  }
+
+  .completion-banner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .completion-seal {
+    width: 48px;
+    height: 48px;
   }
 
   .agent-strip {

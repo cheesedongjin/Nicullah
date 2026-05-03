@@ -27,11 +27,14 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "4173"))
 MAX_AGENT_STEPS = int(os.environ.get("WARROOM_MAX_AGENT_STEPS", "18"))
 COMMAND_TIMEOUT = int(os.environ.get("WARROOM_COMMAND_TIMEOUT", "90"))
-RUNNER_STALE_SECONDS = int(os.environ.get("WARROOM_RUNNER_STALE_SECONDS", "90"))
+RUNNER_STALE_SECONDS = int(os.environ.get("WARROOM_RUNNER_STALE_SECONDS", str(max(180, COMMAND_TIMEOUT + 60))))
 PREVIEW_START_TIMEOUT = int(os.environ.get("WARROOM_PREVIEW_START_TIMEOUT", "25"))
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 IGNORED_PROJECT_DIRS = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "coverage", ".next"}
 LOCAL_PREVIEW_HOSTS = {"127.0.0.1", "localhost", "::1"}
+FUZZY_EDIT_MIN_SCORE = 0.86
+FUZZY_EDIT_MIN_MARGIN = 0.04
+FUZZY_EDIT_MIN_EXACT_ANCHOR_LEN = 12
 TICKET_STATUS_ALIASES = {
     "todo": "ready",
     "in_progress": "progress",
@@ -40,6 +43,9 @@ TICKET_STATUS_ALIASES = {
 }
 TICKET_STATUSES = {"ready", "progress", "review", "blocked", "done"}
 STOPPING_STATUSES = {"stopping", "stopped"}
+PAUSED_STATUSES = {"waiting_for_approval", "waiting_for_handoff", "complete", "error", "stopped"}
+AGENT_SET_PROJECT_STATUSES = {"running", "waiting_for_approval", "complete"}
+AGENT_LEVEL_WAIT_STATUSES = {"idle", "ready", "waiting", "waiting_for_agent", "in_progress", "progress"}
 RESUME_NOTES_PATH = "docs/RESUME.md"
 
 AGENT_ORDER = ["pm", "designer", "backend", "frontend", "qa"]
@@ -163,6 +169,10 @@ def seconds_since(value: str | None) -> float | None:
     if not parsed:
         return None
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+def resumable_project_status(status: str | None) -> bool:
+    return str(status or "") not in PAUSED_STATUSES and str(status or "") not in STOPPING_STATUSES
 
 
 def slugify(value: str) -> str:
@@ -317,6 +327,33 @@ def unresolved_handoff(handoff: dict) -> bool:
 
 def handoff_visible_to(handoff: dict, agent_id: str) -> bool:
     return handoff.get("to") in {agent_id, "all"} or handoff.get("from") == agent_id
+
+
+def project_completion_blockers(state: dict) -> list[str]:
+    open_tickets = [
+        ticket for ticket in state.get("tickets", [])
+        if normalize_ticket_status(ticket.get("status")) != "done"
+    ]
+    unresolved_handoffs = [
+        handoff for handoff in state.get("handoffs", [])
+        if unresolved_handoff(handoff)
+    ]
+    pending_decisions = state.get("pending_decisions", [])
+    open_po_messages = [
+        message for message in state.get("po_messages", [])
+        if message.get("status") in {"open", "received"}
+    ]
+
+    blockers = []
+    if open_tickets:
+        blockers.append(f"{len(open_tickets)} open ticket(s)")
+    if unresolved_handoffs:
+        blockers.append(f"{len(unresolved_handoffs)} unresolved handoff(s)")
+    if pending_decisions:
+        blockers.append(f"{len(pending_decisions)} pending PO decision(s)")
+    if open_po_messages:
+        blockers.append(f"{len(open_po_messages)} open PO message(s)")
+    return blockers
 
 
 def acknowledge_handoffs(state: dict, agent_id: str) -> int:
@@ -805,6 +842,93 @@ def replace_line_window(text: str, find: str, replace: str) -> tuple[str, str] |
     return text[:start_offset] + replacement + text[end_offset:], "indentation-normalized"
 
 
+def contains_line_window(text: str, snippet: str) -> bool:
+    snippet_lines = edge_trimmed_lines(snippet)
+    if not snippet_lines:
+        return False
+
+    snippet_keys = [line.strip() for line in snippet_lines]
+    text_keys = [line.strip() for line in text.splitlines()]
+    width = len(snippet_keys)
+    if width > len(text_keys):
+        return False
+
+    return any(
+        text_keys[start:start + width] == snippet_keys
+        for start in range(len(text_keys) - width + 1)
+    )
+
+
+def replacement_already_applied(text: str, replace: str) -> bool:
+    replace = str(replace or "")
+    replace_lines = edge_trimmed_lines(replace)
+    if not replace_lines:
+        return False
+
+    meaningful_chars = sum(len(line.strip()) for line in replace_lines)
+    if meaningful_chars < 20 and len(replace_lines) < 2:
+        return False
+
+    normalized_replace = replace.replace("\r\n", "\n").replace("\r", "\n")
+    candidates = [
+        replace,
+        normalized_replace,
+        normalized_replace.strip(),
+    ]
+    if any(candidate and candidate in text for candidate in dict.fromkeys(candidates)):
+        return True
+    return contains_line_window(text, normalized_replace)
+
+
+def replace_fuzzy_line_window(text: str, find: str, replace: str) -> tuple[str, str] | None:
+    find_lines = edge_trimmed_lines(find)
+    if len(find_lines) < 3:
+        return None
+
+    find_keys = [line.strip() for line in find_lines]
+    text_lines = text.splitlines(keepends=True)
+    text_keys = [line.strip() for line in text.splitlines()]
+    width = len(find_keys)
+    if width > len(text_keys):
+        return None
+
+    exact_anchors = {
+        key.lower()
+        for key in find_keys
+        if len(key) >= FUZZY_EDIT_MIN_EXACT_ANCHOR_LEN
+    }
+    if not exact_anchors:
+        return None
+
+    find_blob = "\n".join(find_keys).lower()
+    matches = []
+    for start in range(len(text_keys) - width + 1):
+        window_keys = text_keys[start:start + width]
+        anchor_count = sum(1 for key in window_keys if key.lower() in exact_anchors)
+        if not anchor_count:
+            continue
+        score = SequenceMatcher(None, find_blob, "\n".join(window_keys).lower()).ratio()
+        if score >= FUZZY_EDIT_MIN_SCORE:
+            matches.append((score, anchor_count, start))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best_score, _anchor_count, start = matches[0]
+    if len(matches) > 1 and best_score - matches[1][0] < FUZZY_EDIT_MIN_MARGIN:
+        raise ValueError("find text matched multiple fuzzy locations")
+
+    start_offset = sum(len(line) for line in text_lines[:start])
+    end_offset = sum(len(line) for line in text_lines[:start + width])
+    matched_text = text[start_offset:end_offset]
+    replacement = str(replace or "")
+    newline = trailing_newline(matched_text)
+    if newline and not trailing_newline(replacement):
+        replacement += newline
+    return text[:start_offset] + replacement + text[end_offset:], "fuzzy-line-window"
+
+
 def replace_edit_text(text: str, find: str, replace: str) -> tuple[str, str]:
     find = str(find or "")
     replace = str(replace or "")
@@ -825,6 +949,13 @@ def replace_edit_text(text: str, find: str, replace: str) -> tuple[str, str]:
     line_window_result = replace_line_window(text, normalized_find, replace)
     if line_window_result:
         return line_window_result
+
+    if replacement_already_applied(text, replace):
+        return text, "already-applied"
+
+    fuzzy_window_result = replace_fuzzy_line_window(text, normalized_find, replace)
+    if fuzzy_window_result:
+        return fuzzy_window_result
 
     raise ValueError("find text not found")
 
@@ -1038,12 +1169,17 @@ Return strict JSON only:
 
 Prefer small, safe file edits. Write complete files when creating new files.
 Never invent that a command passed unless you ran it. If a role-specific artifact is missing, create or update it before relying on it.
+Only use set_status complete when every ticket is done and there are no unresolved handoffs, open PO messages, or pending PO decisions.
+Use agent_status for role-level states such as idle, waiting, or waiting_for_agent; do not send those through set_status.
 
 Code navigation guidance:
 - Use search_files before editing to locate existing implementations, imports, or usages.
 - Use get_project_stats on first turn to understand project scope and language breakdown.
 - Results from search_files and get_project_stats appear in your next turn's context under search_results and project_stats.
 - recently_modified_files in your context shows what changed most recently — read those before writing to avoid conflicts.
+- Use edit_file find text copied from current file_excerpts, read_file output, or search_files results, not from memory.
+- If edit_file reports "find text not found", do not retry the same edit. First read_file or search_files for the current file,
+  then retry with a current stable anchor or stop if the intended change is already present.
 """
 
 
@@ -1290,20 +1426,83 @@ def resolve_command(root: Path, command: list[str]) -> list[str]:
 
 def run_command(root: Path, command: list[str]) -> dict:
     command = resolve_command(root, command)
-    completed = subprocess.run(
-        command,
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-        timeout=COMMAND_TIMEOUT,
-        shell=False,
-    )
+    preview_url = dev_server_command_url(command)
+    if preview_url:
+        try:
+            status = ensure_preview_reachable(root, preview_url)
+            return {
+                "command": command,
+                "returncode": 0,
+                "stdout": f"{status}\nPreview available at {preview_url}",
+                "stderr": "",
+            }
+        except Exception as exc:
+            return {
+                "command": command,
+                "returncode": 1,
+                "stdout": "",
+                "stderr": str(exc)[-5000:],
+            }
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command,
+            "returncode": 124,
+            "stdout": tail_process_output(exc.stdout),
+            "stderr": (tail_process_output(exc.stderr) + f"\nCommand timed out after {COMMAND_TIMEOUT}s.").strip()[-5000:],
+        }
     return {
         "command": command,
         "returncode": completed.returncode,
         "stdout": completed.stdout[-5000:],
         "stderr": completed.stderr[-5000:],
     }
+
+
+def dev_server_command_url(command: list[str]) -> str | None:
+    if len(command) < 3:
+        return None
+
+    executable = Path(str(command[0])).name.lower()
+    if executable not in {"npm", "npm.cmd", "npm.exe"}:
+        return None
+    if str(command[1]).lower() != "run":
+        return None
+
+    script = str(command[2]).lower()
+    if script not in {"dev", "preview"}:
+        return None
+
+    host = "127.0.0.1"
+    port = 5173 if script == "dev" else 4173
+    args = [str(item) for item in command[3:]]
+    for index, item in enumerate(args):
+        if item == "--host" and index + 1 < len(args):
+            host = args[index + 1]
+        elif item.startswith("--host="):
+            host = item.split("=", 1)[1]
+        elif item == "--port" and index + 1 < len(args):
+            try:
+                port = int(args[index + 1])
+            except ValueError:
+                pass
+        elif item.startswith("--port="):
+            try:
+                port = int(item.split("=", 1)[1])
+            except ValueError:
+                pass
+
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{port}"
 
 
 def package_scripts(root: Path) -> dict[str, str]:
@@ -1351,6 +1550,14 @@ def url_responds(url: str, timeout: float = 2.0) -> bool:
         return 100 <= exc.code < 600
     except (OSError, TimeoutError, urllib.error.URLError):
         return False
+
+
+def tail_process_output(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value)[-5000:]
 
 
 def npm_executable() -> str | None:
@@ -1513,9 +1720,12 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                     if str(exc) == "find text not found":
                         raise ValueError(find_miss_message(action["path"], text, find)) from exc
                     raise
-                target.write_text(new_text, encoding="utf-8")
-                detail = "" if match_kind == "exact" else f" ({match_kind} match)"
-                observations.append(f"edited {action['path']}{detail}")
+                if match_kind == "already-applied":
+                    observations.append(f"edit skipped {action['path']} (already applied)")
+                else:
+                    target.write_text(new_text, encoding="utf-8")
+                    detail = "" if match_kind == "exact" else f" ({match_kind} match)"
+                    observations.append(f"edited {action['path']}{detail}")
             elif action_type == "read_file":
                 target = safe_path(root, action["path"])
                 observations.append(f"read {action['path']}:\n{read_excerpt(target, 3000)}")
@@ -1681,8 +1891,26 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                 record_pm_chat_reply(state, po_message, reply)
                 observations.append("replied to PO chat")
             elif action_type == "set_status":
-                state["status"] = action.get("status", state.get("status", "running"))
-                observations.append(f"status set to {state['status']}")
+                requested_status = str(action.get("status") or "").strip().lower()
+                if requested_status == "complete":
+                    blockers = project_completion_blockers(state)
+                    if blockers:
+                        observations.append(f"ignored complete project status with unfinished work: {', '.join(blockers)}")
+                    else:
+                        state["status"] = requested_status
+                        observations.append(f"status set to {state['status']}")
+                elif requested_status in {"running", "waiting_for_approval"}:
+                    state["status"] = requested_status
+                    observations.append(f"status set to {state['status']}")
+                elif requested_status in AGENT_LEVEL_WAIT_STATUSES:
+                    if not state.get("pending_decisions") and state.get("status") not in STOPPING_STATUSES:
+                        state["status"] = "running"
+                    observations.append(f"kept project running; {requested_status} is an agent-level status")
+                elif requested_status in AGENT_SET_PROJECT_STATUSES:
+                    state["status"] = requested_status
+                    observations.append(f"status set to {state['status']}")
+                else:
+                    observations.append(f"ignored invalid project status {requested_status or '(empty)'}")
             elif action_type == "complete_task":
                 observations.append(action.get("summary", "task complete"))
             else:
@@ -1826,7 +2054,7 @@ def run_project_loop(project_id: str, runner_token: str) -> None:
             time.sleep(0.5)
         else:
             state = load_state(root)
-            if state.get("runner_token") == runner_token and state.get("status") == "running":
+            if state.get("runner_token") == runner_token and resumable_project_status(state.get("status")):
                 state["status"] = "waiting_for_handoff"
                 append_log(
                     state,
@@ -1884,7 +2112,7 @@ def maybe_recover_or_resume_runner(root: Path, state: dict) -> None:
     thread_alive = runner_thread_alive(project_id)
     stale = bool(state.get("running")) and (not thread_alive or age is None or age > RUNNER_STALE_SECONDS)
     if stale:
-        should_resume = state.get("status") == "running"
+        should_resume = resumable_project_status(state.get("status"))
         mark_stale_runner_recovered(root, state, age, resume=should_resume)
         if should_resume:
             ensure_runner(project_id, force=True)
@@ -1897,7 +2125,7 @@ def maybe_recover_or_resume_runner(root: Path, state: dict) -> None:
             write_resume_notes(root, state, "Recovered stale graceful stop")
             append_log(state, "System", "Recovered stale graceful stop and wrote resume notes.", "warning")
             save_state(root, state)
-    elif state.get("status") == "running" and not state.get("running") and not thread_alive:
+    elif resumable_project_status(state.get("status")) and not state.get("running") and not thread_alive:
         ensure_runner(project_id)
 
 

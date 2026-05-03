@@ -135,6 +135,7 @@ function renderProjectList() {
   state.projects.forEach((project) => {
     const item = template.content.firstElementChild.cloneNode(true);
     item.dataset.projectId = project.id;
+    item.dataset.status = project.status || "created";
     item.classList.toggle("is-active", project.id === state.activeProjectId);
     item.querySelector(".project-glyph").textContent = project.name.slice(0, 2).toUpperCase();
     item.querySelector("strong").textContent = project.name;
@@ -161,16 +162,44 @@ function statusLabel(status) {
   return map[status] || status || "대기";
 }
 
+function isCompleteProject(project) {
+  return project?.status === "complete";
+}
+
+function formatProjectTime(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toLocaleString("ko-KR", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function completionDetail(project) {
+  const tickets = project?.tickets || [];
+  const doneTickets = tickets.filter((ticket) => ticketStatusKey(ticket.status) === "done").length;
+  const completedAt = formatProjectTime(project?.updated_at);
+  const ticketText = tickets.length ? `티켓 ${doneTickets}/${tickets.length}개 완료` : "작업 항목 없음";
+  return completedAt ? `${ticketText} · ${completedAt} 완료` : ticketText;
+}
+
 function renderWarRoom() {
   const project = activeProject();
   const pending = project?.pending_decisions?.[0] || null;
+  const main = $(".main-screen");
+  const completed = isCompleteProject(project);
 
   $("#projectTitle").textContent = project?.name || "Nicullah";
-  $("#projectStatusLabel").textContent = project?.status?.toUpperCase() || "STANDBY";
+  $("#projectStatusLabel").textContent = project ? statusLabel(project.status) : "STANDBY";
   $("#rootGoalLabel").textContent = project?.vision || "프로젝트를 생성하면 워룸이 시작됩니다.";
   $("#projectDirectoryLabel").textContent = project ? shortPath(project.directory) : "no project directory";
   $("#openDecisionButton").hidden = !pending;
   $("#openDecisionButton").disabled = !pending;
+  main?.classList.toggle("is-complete-project", completed);
+  renderCompletionBanner(project);
   renderStopResumeButton(project);
   renderPoMessageForm(project);
 
@@ -191,6 +220,15 @@ function renderWarRoom() {
   maybeAutoOpenDecision(pending);
 }
 
+function renderCompletionBanner(project) {
+  const banner = $("#completionBanner");
+  if (!banner) return;
+  const completed = isCompleteProject(project);
+  banner.hidden = !completed;
+  if (!completed) return;
+  $("#completionDetail").textContent = completionDetail(project);
+}
+
 function isStoppedProject(project) {
   return ["stopped", "waiting_for_handoff", "complete"].includes(project?.status);
 }
@@ -205,6 +243,8 @@ function renderStopResumeButton(project) {
     btn.textContent = "작업 중단";
   } else if (project.status === "stopping" || project.stop_requested) {
     btn.textContent = "작업 중단 중...";
+  } else if (isCompleteProject(project)) {
+    btn.textContent = "추가 작업 재개";
   } else if (isStoppedProject(project)) {
     btn.textContent = "재개";
   } else {
@@ -334,8 +374,21 @@ function renderProgress(project) {
   const review = count("review");
   const blocked = count("blocked");
   const ready = count("ready");
+  const completed = isCompleteProject(project);
 
   panel.innerHTML = `
+    ${
+      completed
+        ? `<div class="progress-section completion-summary">
+        <div>
+          <div class="section-title">완료 상태</div>
+          <strong>프로젝트가 완료되었습니다.</strong>
+          <span>${completionDetail(project)}</span>
+        </div>
+      </div>`
+        : ""
+    }
+
     <div class="progress-section">
       <div class="section-title">에이전트 루프</div>
       <div class="iteration-track">
