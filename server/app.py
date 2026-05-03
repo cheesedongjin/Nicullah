@@ -1393,17 +1393,51 @@ Return strict JSON only:
     return {"mode": "work", "reply": "", "agent_status": str(result.get("agent_status") or "Queued for PM")}
 
 
+PYTHON_COMMAND_NAMES = {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+
+
+def python_environment_candidates(root: Path) -> list[Path]:
+    env_roots = [root, ROOT]
+    candidates = []
+    for env_root in env_roots:
+        if os.name == "nt":
+            candidates.extend([
+                env_root / ".venv" / "Scripts" / "python.exe",
+                env_root / "venv" / "Scripts" / "python.exe",
+            ])
+        candidates.extend([
+            env_root / ".venv" / "bin" / "python",
+            env_root / "venv" / "bin" / "python",
+        ])
+    return candidates
+
+
+def preferred_python_executable(root: Path) -> str | None:
+    for candidate in python_environment_candidates(root):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def is_python_command(raw_executable: str) -> bool:
+    return Path(raw_executable).name.lower() in PYTHON_COMMAND_NAMES
+
+
 def resolve_command(root: Path, command: list[str]) -> list[str]:
     if not command or not isinstance(command, list):
         raise ValueError("run_command requires a command array")
     blocked = {"rm", "del", "erase", "rmdir", "rd", "format", "shutdown", "powershell", "cmd"}
-    executable = str(command[0]).lower()
+    raw_executable = str(command[0])
+    executable = raw_executable.lower()
     if executable in blocked:
         raise ValueError(f"Command is not allowed: {command[0]}")
-    if executable == "python":
-        return [sys.executable] + [str(item) for item in command[1:]]
+    if is_python_command(raw_executable):
+        preferred_python = preferred_python_executable(root)
+        if preferred_python:
+            return [preferred_python] + [str(item) for item in command[1:]]
+        if Path(raw_executable).name.lower() in {"python", "python.exe", "python3", "python3.exe"}:
+            return [sys.executable] + [str(item) for item in command[1:]]
 
-    raw_executable = str(command[0])
     resolved = shutil.which(raw_executable)
     if not resolved and ("/" in raw_executable or "\\" in raw_executable):
         executable_path = Path(raw_executable)
@@ -1900,15 +1934,25 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                         state["status"] = requested_status
                         observations.append(f"status set to {state['status']}")
                 elif requested_status in {"running", "waiting_for_approval"}:
-                    state["status"] = requested_status
-                    observations.append(f"status set to {state['status']}")
+                    if state.get("stop_requested") or state.get("status") in STOPPING_STATUSES:
+                        observations.append(f"ignored {requested_status} project status while stop is requested")
+                    else:
+                        state["status"] = requested_status
+                        observations.append(f"status set to {state['status']}")
                 elif requested_status in AGENT_LEVEL_WAIT_STATUSES:
-                    if not state.get("pending_decisions") and state.get("status") not in STOPPING_STATUSES:
+                    if (
+                        not state.get("pending_decisions")
+                        and not state.get("stop_requested")
+                        and state.get("status") not in STOPPING_STATUSES
+                    ):
                         state["status"] = "running"
                     observations.append(f"kept project running; {requested_status} is an agent-level status")
                 elif requested_status in AGENT_SET_PROJECT_STATUSES:
-                    state["status"] = requested_status
-                    observations.append(f"status set to {state['status']}")
+                    if state.get("stop_requested") or state.get("status") in STOPPING_STATUSES:
+                        observations.append(f"ignored {requested_status} project status while stop is requested")
+                    else:
+                        state["status"] = requested_status
+                        observations.append(f"status set to {state['status']}")
                 else:
                     observations.append(f"ignored invalid project status {requested_status or '(empty)'}")
             elif action_type == "complete_task":
@@ -1947,6 +1991,8 @@ def run_agent_turn(root: Path, state: dict, agent_id: str, runner_token: str | N
     if runner_token and load_state(root).get("runner_token") != runner_token:
         return
 
+    state = load_state(root)
+    agent_state = state.setdefault("agents", {}).setdefault(agent_id, {})
     agent_state["message"] = response.get("agent_status") or response.get("summary") or "Updated"
     append_log(state, agent["label"], response.get("summary", "completed a work turn"))
 

@@ -214,6 +214,29 @@ Use this:
         else:
             self.assertEqual(command[0], "backend/venv/bin/pip")
 
+    def test_resolve_command_prefers_workspace_venv_for_python(self):
+        root = ROOT / "demo"
+        expected_path = ROOT / ".venv"
+        expected_path = expected_path / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        expected = str(expected_path)
+
+        with patch("app.Path.is_file", lambda path: str(path) == expected):
+            command = app.resolve_command(root, ["python", "-m", "backend.main"])
+
+        self.assertEqual(command[0], expected)
+
+    def test_resolve_command_replaces_absolute_system_python_with_workspace_venv(self):
+        root = ROOT / "demo"
+        system_python = r"C:\Users\eremb\AppData\Local\Programs\Python\Python312\python.exe"
+        expected_path = ROOT / ".venv"
+        expected_path = expected_path / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        expected = str(expected_path)
+
+        with patch("app.Path.is_file", lambda path: str(path) == expected):
+            command = app.resolve_command(root, [system_python, "-m", "backend.main"])
+
+        self.assertEqual(command[0], expected)
+
     def test_team_actions_create_ticket_handoff_and_review(self):
         state = {"tickets": [], "handoffs": [], "reviews": [], "logs": []}
 
@@ -311,6 +334,71 @@ Use this:
 
         self.assertEqual(state["status"], "running")
         self.assertIn("kept project running; waiting_for_agent is an agent-level status", observations)
+
+    def test_set_status_running_is_ignored_while_stop_requested(self):
+        state = {
+            "status": "stopping",
+            "stop_requested": True,
+            "tickets": [],
+            "handoffs": [],
+            "pending_decisions": [],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "qa",
+            [
+                {"type": "set_status", "status": "running"},
+                {"type": "set_status", "status": "waiting_for_agent"},
+            ],
+        )
+
+        self.assertEqual(state["status"], "stopping")
+        self.assertIn("ignored running project status while stop is requested", observations)
+        self.assertIn("kept project running; waiting_for_agent is an agent-level status", observations)
+
+    def test_run_agent_turn_preserves_concurrent_stop_request(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "status": "running",
+                "running": True,
+                "runner_token": "runner-1",
+                "stop_requested": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "handoffs": [],
+                "pending_decisions": [],
+                "po_messages": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            def request_stop(*_):
+                latest = app.load_state(root)
+                latest["stop_requested"] = True
+                latest["status"] = "stopping"
+                app.save_state(root, latest)
+                return {
+                    "summary": "Finished after stop was requested",
+                    "agent_status": "Trying to resume",
+                    "approval_required": None,
+                    "actions": [{"type": "set_status", "status": "running"}],
+                }
+
+            with patch("app.call_agent", side_effect=request_stop):
+                app.run_agent_turn(root, app.load_state(root), "pm", "runner-1")
+
+            final_state = app.load_state(root)
+            self.assertTrue(final_state["stop_requested"])
+            self.assertEqual(final_state["status"], "stopping")
+            self.assertTrue(any(
+                "ignored running project status while stop is requested" in item["message"]
+                for item in final_state["logs"]
+            ))
 
     def test_edit_file_allows_indentation_normalized_match(self):
         with workspace_tempdir() as tmp:
