@@ -8,12 +8,28 @@ let state = {
   selectedChoiceId: null,
   activeTab: "logs",
   polling: null,
+  filesPanelProjectId: null,
+  fileTreeCollapsed: {},
+  fileTreeScrollTop: 0,
+  fileViewerScrollTop: 0,
   openFilePath: null,
   openFileContent: "",
   searchQuery: "",
 };
 
 let searchTimer = null;
+const DEFAULT_COLLAPSED_DIRS = new Set([
+  ".git",
+  ".next",
+  ".venv",
+  ".warroom",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "venv",
+]);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -78,6 +94,7 @@ function flattenTree(nodes, prefix = "") {
   const result = [];
   for (const node of nodes || []) {
     const path = prefix ? `${prefix}/${node.name}` : node.name;
+    if (node.type === "dir" && isDefaultCollapsedDir(node.name)) continue;
     if (node.type === "file") {
       result.push({ path, size: node.size || 0, mtime: node.mtime || 0 });
     }
@@ -86,6 +103,15 @@ function flattenTree(nodes, prefix = "") {
     }
   }
   return result;
+}
+
+function isDefaultCollapsedDir(name) {
+  return DEFAULT_COLLAPSED_DIRS.has(String(name || "").toLowerCase());
+}
+
+function collapsedDirsForProject(projectId) {
+  if (!state.fileTreeCollapsed[projectId]) state.fileTreeCollapsed[projectId] = {};
+  return state.fileTreeCollapsed[projectId];
 }
 
 // ─── Render ──────────────────────────────────────────────────────────────────
@@ -290,9 +316,23 @@ async function renderFiles(project) {
   const panel = $("#filesPanel");
   if (!project) {
     panel.innerHTML = `<p class="empty-state">프로젝트를 선택하세요.</p>`;
+    state.filesPanelProjectId = null;
     return;
   }
 
+  if (state.filesPanelProjectId === project.id && panel.dataset.ready === "true") return;
+
+  if (state.filesPanelProjectId !== project.id) {
+    state.searchQuery = "";
+    state.openFilePath = null;
+    state.openFileContent = "";
+    state.fileTreeScrollTop = 0;
+    state.fileViewerScrollTop = 0;
+  }
+
+  state.filesPanelProjectId = project.id;
+  panel.dataset.projectId = project.id;
+  panel.dataset.ready = "true";
   const currentQuery = state.searchQuery;
 
   panel.innerHTML = `
@@ -312,6 +352,13 @@ async function renderFiles(project) {
   const searchInput = panel.querySelector(".file-search-input");
   const contentArea = panel.querySelector(".file-content-area");
   const viewer = panel.querySelector("#fileViewer");
+  const tabPanel = $("#tab-files");
+
+  if (tabPanel) {
+    tabPanel.onscroll = () => {
+      state.fileTreeScrollTop = tabPanel.scrollTop;
+    };
+  }
 
   searchInput.addEventListener("input", () => {
     state.searchQuery = searchInput.value;
@@ -328,7 +375,12 @@ async function renderFiles(project) {
     viewer.hidden = true;
     state.openFilePath = null;
     state.openFileContent = "";
+    state.fileViewerScrollTop = 0;
   });
+
+  viewer.querySelector(".file-viewer-content").addEventListener("scroll", (event) => {
+    state.fileViewerScrollTop = event.currentTarget.scrollTop;
+  }, { passive: true });
 
   if (currentQuery && currentQuery.trim().length >= 2) {
     contentArea.innerHTML = `<p class="loading-text">검색 중...</p>`;
@@ -338,8 +390,13 @@ async function renderFiles(project) {
   }
 }
 
-async function loadFileTree(project, contentArea, viewer) {
-  contentArea.innerHTML = `<p class="loading-text">파일 목록 로딩 중...</p>`;
+async function loadFileTree(project, contentArea, viewer, showLoading = true) {
+  const tabPanel = $("#tab-files");
+  const previousTreeScrollTop = tabPanel?.scrollTop || state.fileTreeScrollTop || 0;
+  const viewerContent = viewer.querySelector(".file-viewer-content");
+  const previousViewerScrollTop = viewerContent?.scrollTop || state.fileViewerScrollTop || 0;
+
+  if (showLoading) contentArea.innerHTML = `<p class="loading-text">파일 목록 로딩 중...</p>`;
   try {
     const data = await api(`/api/projects/${project.id}/files`);
     const root = data.root || "";
@@ -363,12 +420,23 @@ async function loadFileTree(project, contentArea, viewer) {
     contentArea.innerHTML = `
       <div class="file-root-path">${escapeHtml(root)}</div>
       ${recentHtml}
-      <div class="file-tree">${renderTree(files, 0, "")}</div>
+      <div class="file-tree">${renderCollapsibleTree(files, 0, "", project.id)}</div>
     `;
+
+    contentArea.querySelectorAll("[data-dir-path]").forEach(el => {
+      el.addEventListener("click", () => {
+        const collapsed = collapsedDirsForProject(project.id);
+        const path = el.dataset.dirPath;
+        collapsed[path] = !(collapsed[path] ?? isDefaultCollapsedDir(path.split("/").pop()));
+        loadFileTree(project, contentArea, viewer, false);
+      });
+    });
 
     contentArea.querySelectorAll("[data-path]").forEach(el => {
       el.addEventListener("click", () => viewFile(project.id, el.dataset.path, viewer));
     });
+
+    if (tabPanel) tabPanel.scrollTop = previousTreeScrollTop;
   } catch {
     contentArea.innerHTML = `<p class="empty-state">파일 목록을 가져올 수 없습니다.</p>`;
   }
@@ -377,6 +445,7 @@ async function loadFileTree(project, contentArea, viewer) {
     viewer.hidden = false;
     viewer.querySelector(".file-viewer-path").textContent = state.openFilePath;
     viewer.querySelector(".file-viewer-content").textContent = state.openFileContent;
+    viewer.querySelector(".file-viewer-content").scrollTop = previousViewerScrollTop;
   }
 }
 
@@ -416,9 +485,11 @@ function renderSearchResults(contentArea, results, query, projectId, viewer) {
 async function viewFile(projectId, path, viewer) {
   state.openFilePath = path;
   state.openFileContent = "로딩 중...";
+  state.fileViewerScrollTop = 0;
   viewer.hidden = false;
   viewer.querySelector(".file-viewer-path").textContent = path;
   viewer.querySelector(".file-viewer-content").textContent = "로딩 중...";
+  viewer.querySelector(".file-viewer-content").scrollTop = 0;
   viewer.scrollIntoView({ behavior: "smooth", block: "nearest" });
   try {
     const data = await api(`/api/projects/${projectId}/file?path=${encodeURIComponent(path)}`);
@@ -428,6 +499,34 @@ async function viewFile(projectId, path, viewer) {
     state.openFileContent = `오류: ${err.message}`;
     viewer.querySelector(".file-viewer-content").textContent = state.openFileContent;
   }
+}
+
+function renderCollapsibleTree(nodes, depth, pathPrefix, projectId) {
+  if (!nodes?.length) return "";
+  const indent = depth * 14;
+  const collapsed = collapsedDirsForProject(projectId);
+  return nodes
+    .map((node) => {
+      const isDir = node.type === "dir";
+      const fullPath = pathPrefix ? `${pathPrefix}/${node.name}` : node.name;
+      const isCollapsed = isDir ? (collapsed[fullPath] ?? isDefaultCollapsedDir(node.name)) : false;
+      const icon = isDir ? (isCollapsed ? "▸" : "▾") : "•";
+      const nameClass = isDir ? "tree-name is-dir" : "tree-name";
+      const sizeHtml = !isDir && node.size ? `<span class="tree-size">${formatSize(node.size)}</span>` : "";
+      const pathAttr = isDir
+        ? `data-dir-path="${escapeHtml(fullPath)}" aria-expanded="${String(!isCollapsed)}"`
+        : `data-path="${escapeHtml(fullPath)}"`;
+      const children = isDir && !isCollapsed && node.children
+        ? renderCollapsibleTree(node.children, depth + 1, fullPath, projectId)
+        : "";
+
+      return `<div class="tree-node is-clickable" style="padding-left:${indent}px" ${pathAttr}>
+        <span class="tree-icon">${icon}</span>
+        <span class="${nameClass}">${escapeHtml(node.name)}</span>
+        ${sizeHtml}
+      </div>${children}`;
+    })
+    .join("");
 }
 
 function renderTree(nodes, depth, pathPrefix) {

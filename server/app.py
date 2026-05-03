@@ -235,6 +235,18 @@ def public_state(state: dict) -> dict:
 def _list_dir(directory: str, depth: int = 0) -> list[dict]:
     if not directory or not os.path.isdir(directory) or depth > 4:
         return []
+    collapsed_by_default = {
+        ".git",
+        ".next",
+        ".venv",
+        ".warroom",
+        "__pycache__",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "venv",
+    }
     result = []
     try:
         entries = sorted(os.scandir(directory), key=lambda e: (not e.is_dir(), e.name.lower()))
@@ -255,7 +267,10 @@ def _list_dir(directory: str, depth: int = 0) -> list[dict]:
                 "mtime": mtime,
             }
             if entry.is_dir():
-                node["children"] = _list_dir(entry.path, depth + 1)
+                if entry.name.lower() in collapsed_by_default:
+                    node["children"] = []
+                else:
+                    node["children"] = _list_dir(entry.path, depth + 1)
             result.append(node)
     except PermissionError:
         pass

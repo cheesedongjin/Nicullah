@@ -1,4 +1,5 @@
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,9 +9,35 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 import app  # noqa: E402
+from gemini_retry_handler import GeminiRetryHandler  # noqa: E402
 
 
 class TeamProtocolTests(unittest.TestCase):
+    def test_gemini_request_timeout_does_not_block_agent_loop(self):
+        class SlowChat:
+            def send_message(self, message):
+                time.sleep(1)
+                return type("Response", (), {"text": "{}"})()
+
+        class SlowClient:
+            class Chats:
+                def create(self, **kwargs):
+                    return SlowChat()
+
+            chats = Chats()
+
+        handler = GeminiRetryHandler(
+            SlowClient(),
+            sleep_func=lambda _: None,
+            request_timeout=0.01,
+        )
+
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            handler.generate_response(history=[], message="{}", system_instruction="test")
+
+        self.assertLess(time.monotonic() - started, 0.5)
+
     def test_extract_json_accepts_fenced_json_and_trailing_commas(self):
         payload = app.extract_json(
             """```json

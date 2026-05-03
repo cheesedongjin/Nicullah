@@ -1,6 +1,9 @@
 import random
 import time
 import logging
+import os
+import queue
+import threading
 
 try:
     from google.genai import types
@@ -24,9 +27,12 @@ class GeminiRetryHandler:
         "gemini-2.5-flash-lite"
     ]
 
-    def __init__(self, client, sleep_func=time.sleep):
+    def __init__(self, client, sleep_func=time.sleep, request_timeout=None):
         self.client = client
         self.sleep_func = sleep_func
+        self.request_timeout = float(
+            request_timeout or os.environ.get("WARROOM_GEMINI_REQUEST_TIMEOUT", "120")
+        )
 
     def generate_response(
         self,
@@ -73,14 +79,7 @@ class GeminiRetryHandler:
 
             for attempt in range(max_retries):
                 try:
-                    chat = self.client.chats.create(
-                        model=model_name,
-                        history=history,
-                        config=config
-                    )
-
-                    response = chat.send_message(message)
-                    return response.text
+                    return self._send_message_with_timeout(model_name, history, config, message)
 
                 except Exception as e:
                     last_exception = e
@@ -117,3 +116,31 @@ class GeminiRetryHandler:
         if "429" in msg or "quota" in msg or "rate limit" in msg:
             return True
         return False
+
+    def _send_message_with_timeout(self, model_name, history, config, message):
+        result_queue = queue.Queue(maxsize=1)
+
+        def worker():
+            try:
+                chat = self.client.chats.create(
+                    model=model_name,
+                    history=history,
+                    config=config
+                )
+                response = chat.send_message(message)
+                result_queue.put(("ok", response.text))
+            except BaseException as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(self.request_timeout)
+        if thread.is_alive():
+            raise TimeoutError(
+                f"Gemini request timed out after {self.request_timeout:.0f}s on {model_name}"
+            )
+
+        status, payload = result_queue.get()
+        if status == "error":
+            raise payload
+        return payload
