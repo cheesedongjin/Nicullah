@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,8 +27,10 @@ PORT = int(os.environ.get("PORT", "4173"))
 MAX_AGENT_STEPS = int(os.environ.get("WARROOM_MAX_AGENT_STEPS", "18"))
 COMMAND_TIMEOUT = int(os.environ.get("WARROOM_COMMAND_TIMEOUT", "90"))
 RUNNER_STALE_SECONDS = int(os.environ.get("WARROOM_RUNNER_STALE_SECONDS", "90"))
+PREVIEW_START_TIMEOUT = int(os.environ.get("WARROOM_PREVIEW_START_TIMEOUT", "25"))
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 IGNORED_PROJECT_DIRS = {".warroom", ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "coverage", ".next"}
+LOCAL_PREVIEW_HOSTS = {"127.0.0.1", "localhost", "::1"}
 TICKET_STATUS_ALIASES = {
     "todo": "ready",
     "in_progress": "progress",
@@ -132,7 +136,9 @@ TEAM_PROTOCOL = [
 ]
 
 state_lock = threading.RLock()
+preview_lock = threading.RLock()
 runner_threads: dict[str, threading.Thread] = {}
+preview_processes: dict[str, subprocess.Popen] = {}
 
 
 def now() -> str:
@@ -779,6 +785,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
             "stop_requested": bool(state.get("stop_requested")),
             "graceful_stop_active": bool(state.get("graceful_stop_active")),
             "resume_notes_file": RESUME_NOTES_PATH,
+            "preview_url": preferred_preview_url(root),
         },
         "current_agent": agent_id,
         "agents": state.get("agents", {}),
@@ -849,6 +856,8 @@ creating/changing project work, answer it with reply_to_po and do not create tic
 Use pm_chat as the remembered PO/PM conversation for this project session.
 If project.graceful_stop_active is true, do not start new feature scope. Finish the smallest useful slice,
 make the project runnable if possible, update {RESUME_NOTES_PATH} with resume notes, and stop cleanly.
+When you need a UI screenshot, use project.preview_url when present unless a current handoff names a different
+verified URL. capture_preview can start local npm dev/preview servers for localhost URLs when package.json exposes them.
 
 Role responsibilities:
 {bullet_list(agent['responsibilities'])}
@@ -882,7 +891,7 @@ Return strict JSON only:
     {{"type": "search_files", "query": "text to search across all project files"}},
     {{"type": "get_project_stats"}},
     {{"type": "run_command", "command": ["python", "-m", "unittest"]}},
-    {{"type": "capture_preview", "url": "http://127.0.0.1:3000", "note": "what to inspect"}},
+    {{"type": "capture_preview", "url": "http://127.0.0.1:5173", "note": "what to inspect"}},
     {{"type": "add_ticket", "title": "task", "owner": "frontend", "status": "ready|progress|review|blocked|done", "priority": "P0|P1|P2|P3", "description": "scope", "acceptance_criteria": ["criterion"]}},
     {{"type": "update_ticket", "id": "ticket-id", "status": "ready|progress|review|blocked|done", "notes": "what changed"}},
     {{"type": "handoff", "to": "pm|designer|backend|frontend|qa|all", "message": "next action needed", "files": ["path"], "ticket_id": "ticket-id", "priority": "normal|high"}},
@@ -1165,6 +1174,145 @@ def run_command(root: Path, command: list[str]) -> dict:
     }
 
 
+def package_scripts(root: Path) -> dict[str, str]:
+    package_path = root / "package.json"
+    if not package_path.exists():
+        return {}
+    try:
+        data = json.loads(package_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(key): str(value) for key, value in scripts.items()}
+
+
+def preferred_preview_url(root: Path) -> str:
+    scripts = package_scripts(root)
+    if "vite" in scripts.get("dev", ""):
+        return "http://127.0.0.1:5173"
+    if "vite" in scripts.get("preview", ""):
+        return "http://127.0.0.1:4173"
+    return ""
+
+
+def local_http_url(url: str):
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.hostname not in LOCAL_PREVIEW_HOSTS:
+        return None
+    return parsed
+
+
+def url_responds(url: str, timeout: float = 2.0) -> bool:
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"User-Agent": "Nicullah preview capture"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 100 <= response.status < 600
+    except urllib.error.HTTPError as exc:
+        return 100 <= exc.code < 600
+    except (OSError, TimeoutError, urllib.error.URLError):
+        return False
+
+
+def npm_executable() -> str | None:
+    names = ["npm.cmd", "npm.exe", "npm"] if os.name == "nt" else ["npm"]
+    for name in names:
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+    return None
+
+
+def local_preview_command(root: Path, parsed) -> list[str] | None:
+    scripts = package_scripts(root)
+    if "dev" in scripts:
+        script = "dev"
+    elif "preview" in scripts:
+        script = "preview"
+    else:
+        return None
+
+    npm = npm_executable()
+    if not npm:
+        return None
+
+    host = parsed.hostname or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return [npm, "run", script, "--", "--host", host, "--port", str(port), "--strictPort"]
+
+
+def preview_process_key(root: Path, parsed) -> str:
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return f"{root.resolve()}::{parsed.hostname}:{port}"
+
+
+def start_local_preview_process(root: Path, parsed, command: list[str]) -> subprocess.Popen:
+    key = preview_process_key(root, parsed)
+    with preview_lock:
+        existing = preview_processes.get(key)
+        if existing and existing.poll() is None:
+            return existing
+
+        popen_kwargs = {
+            "cwd": str(root),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "shell": False,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        process = subprocess.Popen(command, **popen_kwargs)
+        preview_processes[key] = process
+        return process
+
+
+def ensure_preview_reachable(root: Path, url: str) -> str:
+    if url_responds(url):
+        return "Preview URL was already reachable."
+
+    parsed = local_http_url(url)
+    if not parsed:
+        return "Preview URL is not a local HTTP URL; capture will try it directly."
+
+    command = local_preview_command(root, parsed)
+    if not command:
+        raise RuntimeError(
+            f"Preview URL is not reachable: {url}. "
+            "No package.json dev or preview script was found to start it automatically."
+        )
+
+    try:
+        process = start_local_preview_process(root, parsed, command)
+    except OSError as exc:
+        raise RuntimeError(f"Could not start preview server with {' '.join(command)}: {exc}") from exc
+
+    deadline = time.time() + PREVIEW_START_TIMEOUT
+    while time.time() < deadline:
+        if url_responds(url):
+            return f"Started preview server with {' '.join(command)}."
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Preview URL did not become reachable: {url}. "
+                f"{' '.join(command)} exited with code {process.returncode}."
+            )
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Preview URL did not become reachable within {PREVIEW_START_TIMEOUT}s: {url}. "
+        f"Started command: {' '.join(command)}"
+    )
+
+
 def capture_preview(root: Path, url: str, note: str) -> dict:
     screenshots = root / ".warroom" / "screenshots"
     screenshots.mkdir(parents=True, exist_ok=True)
@@ -1176,6 +1324,7 @@ def capture_preview(root: Path, url: str, note: str) -> dict:
         node = str(bundled) if bundled.exists() else None
     if not node:
         raise RuntimeError("Node.js is required for preview capture.")
+    preview_status = ensure_preview_reachable(root, url)
     completed = subprocess.run(
         [node, str(script), url, str(output)],
         cwd=str(ROOT),
@@ -1202,6 +1351,7 @@ def capture_preview(root: Path, url: str, note: str) -> dict:
     return {
         "screenshot": str(output),
         "review": getattr(response, "text", "") or "",
+        "preview_status": preview_status,
     }
 
 
@@ -1284,7 +1434,8 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                     "time": now(),
                     **result,
                 })
-                observations.append(f"captured preview {result['screenshot']}: {result['review'][:800]}")
+                status = result.get("preview_status", "Preview captured.")
+                observations.append(f"{status} Captured preview {result['screenshot']}: {result['review'][:800]}")
             elif action_type == "add_ticket":
                 ticket = {
                     "id": make_id("ticket"),
