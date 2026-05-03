@@ -253,6 +253,62 @@ Use this:
         self.assertEqual(app.acknowledge_handoffs(state, "frontend"), 2)
         self.assertTrue(all(item["status"] == "received" for item in state["handoffs"]))
 
+    def test_edit_file_allows_indentation_normalized_match(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            target = root / "backend" / "services.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("def load():\n    return {'ok': True}\n", encoding="utf-8")
+
+            observations = app.execute_actions(
+                root,
+                {"logs": []},
+                "backend",
+                [
+                    {
+                        "type": "edit_file",
+                        "path": "backend/services.py",
+                        "find": "def load():\nreturn {'ok': True}",
+                        "replace": "def load():\n    return {'ok': False}",
+                    }
+                ],
+            )
+
+            self.assertIn("edited backend/services.py (indentation-normalized match)", observations)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "def load():\n    return {'ok': False}\n",
+            )
+
+    def test_edit_file_find_miss_reports_current_context(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            target = root / "backend" / "services.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("def service():\n    return 'current'\n", encoding="utf-8")
+            state = {"logs": []}
+
+            observations = app.execute_actions(
+                root,
+                state,
+                "backend",
+                [
+                    {
+                        "type": "edit_file",
+                        "path": "backend/services.py",
+                        "find": "def service():\n    return 'old'\n",
+                        "replace": "def service():\n    return 'new'\n",
+                    }
+                ],
+            )
+
+            self.assertIn("edit_file failed: find text not found in backend/services.py", observations[0])
+            self.assertIn("Closest current excerpt", observations[0])
+            self.assertIn("L1: def service():", observations[0])
+            self.assertIn("Read the file or search for a stable anchor", observations[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), "def service():\n    return 'current'\n")
+            self.assertEqual(state["logs"][-1]["level"], "error")
+
     def test_request_po_approval_action_blocks_only_requesting_agent(self):
         state = {
             "agents": {

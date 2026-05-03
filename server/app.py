@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -752,6 +753,137 @@ def read_excerpt(path: Path, max_chars: int = 10000) -> str:
     return text[:max_chars]
 
 
+def edge_trimmed_lines(text: str) -> list[str]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def trailing_newline(text: str) -> str:
+    if text.endswith("\r\n"):
+        return "\r\n"
+    if text.endswith("\n"):
+        return "\n"
+    if text.endswith("\r"):
+        return "\r"
+    return ""
+
+
+def replace_line_window(text: str, find: str, replace: str) -> tuple[str, str] | None:
+    find_lines = edge_trimmed_lines(find)
+    if not find_lines:
+        return None
+
+    find_keys = [line.strip() for line in find_lines]
+    text_lines = text.splitlines(keepends=True)
+    text_keys = [line.strip() for line in text.splitlines()]
+    width = len(find_keys)
+    if width > len(text_keys):
+        return None
+
+    matches = [
+        start
+        for start in range(len(text_keys) - width + 1)
+        if text_keys[start:start + width] == find_keys
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ValueError("find text matched multiple indentation-normalized locations")
+
+    start = matches[0]
+    start_offset = sum(len(line) for line in text_lines[:start])
+    end_offset = sum(len(line) for line in text_lines[:start + width])
+    matched_text = text[start_offset:end_offset]
+    replacement = replace
+    newline = trailing_newline(matched_text)
+    if newline and not trailing_newline(replacement):
+        replacement += newline
+    return text[:start_offset] + replacement + text[end_offset:], "indentation-normalized"
+
+
+def replace_edit_text(text: str, find: str, replace: str) -> tuple[str, str]:
+    find = str(find or "")
+    replace = str(replace or "")
+    if not find.strip():
+        raise ValueError("edit_file requires a non-empty find string")
+
+    if find in text:
+        return text.replace(find, replace, 1), "exact"
+
+    normalized_find = find.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized_find != find and normalized_find in text:
+        return text.replace(normalized_find, replace, 1), "line-ending-normalized"
+
+    trimmed_find = normalized_find.strip()
+    if trimmed_find and trimmed_find != normalized_find and trimmed_find in text:
+        return text.replace(trimmed_find, replace, 1), "edge-trimmed"
+
+    line_window_result = replace_line_window(text, normalized_find, replace)
+    if line_window_result:
+        return line_window_result
+
+    raise ValueError("find text not found")
+
+
+def compact_snippet(text: str, max_chars: int = 240) -> str:
+    snippet = " ".join(str(text or "").split())
+    if len(snippet) > max_chars:
+        return snippet[:max_chars - 3] + "..."
+    return snippet
+
+
+def numbered_excerpt(lines: list[str], start: int, end: int) -> str:
+    return "\n".join(f"L{line_no + 1}: {lines[line_no][:240]}" for line_no in range(start, end))
+
+
+def closest_current_excerpt(text: str, find: str, context_lines: int = 2) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return "Current file is empty."
+
+    needles = [line.strip() for line in str(find or "").splitlines() if len(line.strip()) >= 8]
+    if not needles:
+        preview_end = min(len(lines), 6)
+        return "Current file starts with:\n" + numbered_excerpt(lines, 0, preview_end)
+
+    best_index = -1
+    best_score = 0.0
+    for needle in sorted(needles, key=len, reverse=True)[:8]:
+        needle_lower = needle.lower()[:300]
+        for index, line in enumerate(lines):
+            current = line.strip().lower()[:300]
+            if not current:
+                continue
+            score = 1.0 if needle_lower in current else SequenceMatcher(None, needle_lower, current).ratio()
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+    if best_index < 0 or best_score < 0.55:
+        preview_end = min(len(lines), 6)
+        return "No close line match. Current file starts with:\n" + numbered_excerpt(lines, 0, preview_end)
+
+    start = max(0, best_index - context_lines)
+    end = min(len(lines), best_index + context_lines + 1)
+    return f"Closest current excerpt around L{best_index + 1}:\n{numbered_excerpt(lines, start, end)}"
+
+
+def find_miss_message(path: str, text: str, find: str) -> str:
+    parts = [
+        f"find text not found in {path}. The file exists, but the requested find snippet does not match its current contents.",
+    ]
+    snippet = compact_snippet(find)
+    if snippet:
+        parts.append(f"Find snippet: {snippet}")
+    parts.append(closest_current_excerpt(text, find))
+    parts.append("Read the file or search for a stable anchor before retrying the edit.")
+    return "\n".join(parts)
+
+
 def collect_context(root: Path, state: dict, agent_id: str) -> dict:
     core_files = [
         "project_context.md",
@@ -1375,10 +1507,15 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                 target = safe_path(root, action["path"])
                 text = target.read_text(encoding="utf-8", errors="replace")
                 find = action.get("find", "")
-                if find not in text:
-                    raise ValueError(f"find text not found in {action['path']}")
-                target.write_text(text.replace(find, action.get("replace", ""), 1), encoding="utf-8")
-                observations.append(f"edited {action['path']}")
+                try:
+                    new_text, match_kind = replace_edit_text(text, find, action.get("replace", ""))
+                except ValueError as exc:
+                    if str(exc) == "find text not found":
+                        raise ValueError(find_miss_message(action["path"], text, find)) from exc
+                    raise
+                target.write_text(new_text, encoding="utf-8")
+                detail = "" if match_kind == "exact" else f" ({match_kind} match)"
+                observations.append(f"edited {action['path']}{detail}")
             elif action_type == "read_file":
                 target = safe_path(root, action["path"])
                 observations.append(f"read {action['path']}:\n{read_excerpt(target, 3000)}")
