@@ -41,6 +41,13 @@
             <h1 id="projectTitle">Nicullah</h1>
           </div>
           <div class="room-actions">
+            <form class="po-message-form" id="poMessageForm">
+              <input id="poMessageInput" type="text" autocomplete="off" placeholder="PM에게 지시 또는 피드백 보내기" />
+              <button class="secondary-button" id="poMessageButton" type="submit">전송</button>
+            </form>
+            <button class="secondary-button stop-resume-button" id="stopResumeButton" type="button" hidden>
+              작업 중단
+            </button>
             <button class="ghost-button" id="openDecisionButton" type="button" hidden>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 21h18L12 3Z"/><path d="M12 9v4M12 17h.01"/></svg>
               승인 요청
@@ -181,6 +188,20 @@
             직접 입력
             <textarea id="customPrompt" rows="4" placeholder="예: 외부 결제 API는 쓰지 말고 자체 DB 모델로 먼저 진행"></textarea>
           </label>
+          <div class="custom-color-panel" id="customColorPanel" hidden>
+            <label>
+              색상 1
+              <input id="customColorOne" type="color" value="#101413" />
+            </label>
+            <label>
+              색상 2
+              <input id="customColorTwo" type="color" value="#4cc9f0" />
+            </label>
+            <label>
+              색상 3
+              <input id="customColorThree" type="color" value="#e8f971" />
+            </label>
+          </div>
         </div>
 
         <footer class="modal-footer">

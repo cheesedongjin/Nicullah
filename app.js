@@ -15,6 +15,7 @@ let state = {
   openFilePath: null,
   openFileContent: "",
   searchQuery: "",
+  deferredDecisionIds: new Set(),
 };
 
 let searchTimer = null;
@@ -150,6 +151,8 @@ function statusLabel(status) {
   const map = {
     created: "생성됨",
     running: "실행 중",
+    stopping: "작업 중단 중",
+    stopped: "중단됨",
     waiting_for_handoff: "대기 중",
     waiting_for_approval: "승인 대기",
     complete: "완료",
@@ -168,6 +171,8 @@ function renderWarRoom() {
   $("#projectDirectoryLabel").textContent = project ? shortPath(project.directory) : "no project directory";
   $("#openDecisionButton").hidden = !pending;
   $("#openDecisionButton").disabled = !pending;
+  renderStopResumeButton(project);
+  renderPoMessageForm(project);
 
   const agents = project?.agents || {};
   setAgent("pm", agents.pm);
@@ -182,6 +187,50 @@ function renderWarRoom() {
   if (state.activeTab === "files") renderFiles(project);
 
   drawGraph(Boolean(project), project?.iteration || 0);
+  maybeAutoOpenDecision(pending);
+}
+
+function isStoppedProject(project) {
+  return ["stopped", "waiting_for_handoff", "complete"].includes(project?.status);
+}
+
+function renderStopResumeButton(project) {
+  const btn = $("#stopResumeButton");
+  if (!btn) return;
+  btn.hidden = !project;
+  btn.disabled = !project || project.status === "stopping" || project.stop_requested;
+
+  if (!project) {
+    btn.textContent = "작업 중단";
+  } else if (project.status === "stopping" || project.stop_requested) {
+    btn.textContent = "작업 중단 중...";
+  } else if (isStoppedProject(project)) {
+    btn.textContent = "재개";
+  } else {
+    btn.textContent = "작업 중단";
+  }
+}
+
+function renderPoMessageForm(project) {
+  const input = $("#poMessageInput");
+  const button = $("#poMessageButton");
+  if (!input || !button) return;
+  const enabled = Boolean(project);
+  input.disabled = !enabled;
+  button.disabled = !enabled || !input.value.trim();
+  input.placeholder = enabled ? "PM에게 지시 또는 피드백 보내기" : "프로젝트를 먼저 선택하세요";
+}
+
+function maybeAutoOpenDecision(decision) {
+  const dialog = $("#decisionModal");
+  if (!decision || !dialog || dialog.open) return;
+  if (state.deferredDecisionIds.has(decision.id)) return;
+  if (state.selectedDecision?.id === decision.id) return;
+  window.setTimeout(() => {
+    const latest = activeProject()?.pending_decisions?.[0];
+    if (!latest || latest.id !== decision.id || dialog.open) return;
+    openDecision();
+  }, 0);
 }
 
 function ticketStatusKey(status) {
@@ -594,9 +643,36 @@ function switchTab(tab) {
 
 // ─── Modals ───────────────────────────────────────────────────────────────────
 
+function decisionAllowsColors(decision) {
+  if (!decision) return false;
+  if (decision.allow_colors || decision.requires_colors || decision.color_required) return true;
+  return (decision.options || []).some((option) => normalizeColors(option.colors).length > 0);
+}
+
+function normalizeColors(colors) {
+  if (!Array.isArray(colors)) return [];
+  return colors
+    .map((color) => String(color || "").trim())
+    .filter((color) => /^#[0-9a-f]{6}$/i.test(color));
+}
+
+function setCustomPanelVisibility(choiceId, allowsColors) {
+  const isCustom = choiceId === "custom";
+  $("#customPanel").hidden = !isCustom;
+  $("#customColorPanel").hidden = !isCustom || !allowsColors;
+}
+
+function selectedCustomColors(decision) {
+  if (state.selectedChoiceId !== "custom" || !decisionAllowsColors(decision)) return [];
+  return ["#customColorOne", "#customColorTwo", "#customColorThree"]
+    .map((selector) => $(selector)?.value)
+    .filter(Boolean);
+}
+
 function renderChoices(decision) {
   const template = $("#choiceTemplate");
   const grid = $("#choiceGrid");
+  const allowsColors = decisionAllowsColors(decision);
   const options = [...(decision?.options || [])];
   if (!options.some((o) => o.id === "custom")) {
     options.push({
@@ -604,29 +680,31 @@ function renderChoices(decision) {
       title: "직접 입력",
       description: "PO가 조건을 직접 지정합니다.",
       recommendation: "Manual",
-      colors: ["#050706", "#13dced", "#d9ff8b"],
     });
   }
 
   state.selectedChoiceId = options[0]?.id || "custom";
   $("#decisionQuestion").textContent = decision?.question || "PO 승인이 필요합니다.";
-  $("#customPanel").hidden = state.selectedChoiceId !== "custom";
+  setCustomPanelVisibility(state.selectedChoiceId, allowsColors);
   grid.innerHTML = "";
 
   options.forEach((choice) => {
     const node = template.content.firstElementChild.cloneNode(true);
+    const colors = normalizeColors(choice.colors);
+    const swatches = node.querySelector(".swatches");
     node.dataset.choice = choice.id;
     node.setAttribute("aria-pressed", String(choice.id === state.selectedChoiceId));
     node.querySelector(".recommendation").textContent = choice.recommendation || "";
     node.querySelector("strong").textContent = choice.title || choice.id;
     node.querySelector("small").textContent = choice.description || "";
-    node.querySelector(".swatches").innerHTML = (choice.colors || ["#050706", "#13dced", "#d9ff8b"])
+    swatches.hidden = colors.length === 0;
+    swatches.innerHTML = colors
       .slice(0, 3)
       .map((color) => `<i style="background:${color}"></i>`)
       .join("");
     node.addEventListener("click", () => {
       state.selectedChoiceId = choice.id;
-      $("#customPanel").hidden = choice.id !== "custom";
+      setCustomPanelVisibility(choice.id, allowsColors);
       document.querySelectorAll(".choice-card").forEach((card) => {
         card.setAttribute("aria-pressed", String(card.dataset.choice === choice.id));
       });
@@ -666,18 +744,63 @@ async function handleApproveDecision(event) {
   if (!project || !decision) return;
 
   const note = $("#customPrompt").value.trim();
+  const customColors = selectedCustomColors(decision);
   const btn = $("#confirmDecisionButton");
   btn.disabled = true;
   try {
     await api(`/api/projects/${project.id}/approve`, {
       method: "POST",
-      body: JSON.stringify({ decision_id: decision.id, choice_id: state.selectedChoiceId, note }),
+      body: JSON.stringify({
+        decision_id: decision.id,
+        choice_id: state.selectedChoiceId,
+        note,
+        custom_colors: customColors,
+      }),
     });
     closeDialog($("#decisionModal"));
+    state.deferredDecisionIds.delete(decision.id);
     state.selectedDecision = null;
     await refreshProjects();
   } finally {
     btn.disabled = false;
+  }
+}
+
+async function handleStopResume() {
+  const project = activeProject();
+  if (!project) return;
+  const btn = $("#stopResumeButton");
+  btn.disabled = true;
+  try {
+    if (isStoppedProject(project)) {
+      await api(`/api/projects/${project.id}/resume`, { method: "POST" });
+    } else {
+      btn.textContent = "작업 중단 중...";
+      await api(`/api/projects/${project.id}/stop`, { method: "POST" });
+    }
+    await refreshProjects();
+  } finally {
+    renderStopResumeButton(activeProject());
+  }
+}
+
+async function handlePoMessage(event) {
+  event.preventDefault();
+  const project = activeProject();
+  const input = $("#poMessageInput");
+  const message = input.value.trim();
+  if (!project || !message) return;
+  const button = $("#poMessageButton");
+  button.disabled = true;
+  try {
+    await api(`/api/projects/${project.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    });
+    input.value = "";
+    await refreshProjects();
+  } finally {
+    renderPoMessageForm(activeProject());
   }
 }
 
@@ -810,7 +933,13 @@ async function init() {
   $("#openDecisionButton").addEventListener("click", openDecision);
   $("#decisionForm").addEventListener("submit", handleApproveDecision);
   $("#closeDecisionModal").addEventListener("click", () => closeDialog($("#decisionModal")));
-  $("#deferDecisionButton").addEventListener("click", () => closeDialog($("#decisionModal")));
+  $("#deferDecisionButton").addEventListener("click", () => {
+    if (state.selectedDecision?.id) state.deferredDecisionIds.add(state.selectedDecision.id);
+    closeDialog($("#decisionModal"));
+  });
+  $("#stopResumeButton").addEventListener("click", handleStopResume);
+  $("#poMessageForm").addEventListener("submit", handlePoMessage);
+  $("#poMessageInput").addEventListener("input", () => renderPoMessageForm(activeProject()));
   window.addEventListener("resize", () => drawGraph(Boolean(activeProject()), activeProject()?.iteration || 0));
 
   document.querySelectorAll(".tab-btn").forEach((btn) => {

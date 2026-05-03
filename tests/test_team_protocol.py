@@ -1,7 +1,8 @@
 import sys
-import tempfile
+import shutil
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,17 @@ sys.path.insert(0, str(ROOT / "server"))
 
 import app  # noqa: E402
 from gemini_retry_handler import GeminiRetryHandler  # noqa: E402
+
+
+@contextmanager
+def workspace_tempdir():
+    base = ROOT / "test_tmp"
+    path = base / f"test-{time.time_ns()}"
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield str(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class TeamProtocolTests(unittest.TestCase):
@@ -241,6 +253,182 @@ Use this:
         self.assertEqual(app.acknowledge_handoffs(state, "frontend"), 2)
         self.assertTrue(all(item["status"] == "received" for item in state["handoffs"]))
 
+    def test_request_po_approval_action_blocks_only_requesting_agent(self):
+        state = {
+            "agents": {
+                "pm": {"status": "idle", "message": "Ready", "blocked": False},
+                "frontend": {"status": "idle", "message": "Ready", "blocked": False},
+            },
+            "pending_decisions": [],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "pm",
+            [
+                {
+                    "type": "request_po_approval",
+                    "question": "Choose a UI direction",
+                    "options": [{"id": "modern", "title": "Modern", "description": "Cleaner"}],
+                    "blocks_agent": True,
+                }
+            ],
+        )
+
+        self.assertIn("requested PO approval", observations[0])
+        self.assertEqual(state["pending_decisions"][0]["question"], "Choose a UI direction")
+        self.assertTrue(state["agents"]["pm"]["blocked"])
+        self.assertFalse(state["agents"]["frontend"]["blocked"])
+        self.assertEqual(state["pending_decisions"][0]["options"][0]["colors"], [])
+
+    def test_request_po_approval_can_enable_color_selection(self):
+        state = {
+            "agents": {"designer": {"status": "idle", "message": "Ready", "blocked": False}},
+            "pending_decisions": [],
+            "logs": [],
+        }
+
+        app.execute_actions(
+            ROOT,
+            state,
+            "designer",
+            [
+                {
+                    "type": "request_po_approval",
+                    "question": "Choose a palette",
+                    "options": [
+                        {
+                            "id": "calm",
+                            "title": "Calm",
+                            "description": "Muted palette",
+                            "colors": ["#101413", "not-a-color", "#4cc9f0"],
+                        }
+                    ],
+                    "allow_colors": True,
+                }
+            ],
+        )
+
+        decision = state["pending_decisions"][0]
+        self.assertTrue(decision["allow_colors"])
+        self.assertEqual(decision["options"][0]["colors"], ["#101413", "#4cc9f0"])
+
+    def test_po_message_resumes_stopped_project_and_handoffs_to_pm(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "stopped",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root), patch("app.ensure_runner") as ensure_runner:
+                public = app.send_po_message("project-demo", {"message": "다크 모드를 추가해줘"})
+
+        self.assertEqual(public["status"], "running")
+        self.assertEqual(public["po_messages"][0]["message"], "다크 모드를 추가해줘")
+        self.assertEqual(public["handoffs"][0]["to"], "pm")
+        ensure_runner.assert_called_once_with("project-demo")
+
+    def test_broad_ui_po_message_queues_pm_when_ai_ready(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "running",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root), patch("app.ensure_runner"), patch(
+                "app.gemini_status",
+                return_value={"ready": True, "reason": ""},
+            ):
+                public = app.send_po_message("project-demo", {"message": "UI를 더 모던하게 바꿔줘"})
+
+        self.assertEqual(public["pending_decisions"], [])
+        self.assertFalse(public["agents"]["pm"]["blocked"])
+        self.assertEqual(public["po_messages"][0]["status"], "open")
+
+    def test_broad_ui_po_message_uses_fallback_only_when_ai_unavailable(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "running",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root), patch("app.ensure_runner"), patch(
+                "app.gemini_status",
+                return_value={"ready": False, "reason": "offline"},
+            ):
+                public = app.send_po_message("project-demo", {"message": "UI를 더 모던하게 바꿔줘"})
+
+        self.assertEqual(len(public["pending_decisions"]), 1)
+        self.assertEqual(public["pending_decisions"][0]["agent"], "pm")
+        self.assertTrue(public["agents"]["pm"]["blocked"])
+        self.assertEqual(public["po_messages"][0]["status"], "awaiting_po_decision")
+
+    def test_stop_project_writes_resume_notes_when_not_running(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "running",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "tickets": [{"id": "T1", "title": "Next task", "status": "ready", "owner": "pm"}],
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root):
+                public = app.stop_project("project-demo")
+
+            resume_notes = root / app.RESUME_NOTES_PATH
+            self.assertEqual(public["status"], "stopped")
+            self.assertTrue(resume_notes.exists())
+            self.assertIn("Resume Notes", resume_notes.read_text(encoding="utf-8"))
+
     def test_collect_context_exposes_shared_team_memory(self):
         state = {
             "name": "Demo",
@@ -274,7 +462,7 @@ Use this:
         self.assertEqual(context["previews"][0]["review"], "layout ok")
 
     def test_project_tree_prunes_dependency_directories(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace_tempdir() as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
             (root / "src" / "App.jsx").write_text("export default function App() {}", encoding="utf-8")

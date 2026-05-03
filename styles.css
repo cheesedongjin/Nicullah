@@ -307,7 +307,24 @@ h1 {
 .room-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
   flex: 0 0 auto;
+}
+
+.po-message-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 320px) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.po-message-form input {
+  min-height: 38px;
+}
+
+.stop-resume-button {
+  white-space: nowrap;
 }
 
 /* ─── Content grid ───────────────────────────────── */
@@ -1314,6 +1331,26 @@ textarea {
   background: rgba(255, 255, 255, 0.025);
 }
 
+.custom-color-panel {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.custom-color-panel label {
+  gap: 6px;
+}
+
+input[type="color"] {
+  width: 100%;
+  min-height: 38px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #020302;
+  cursor: pointer;
+}
+
 /* ─── Responsive ─────────────────────────────────── */
 
 @media (max-width: 1200px) {
@@ -1377,6 +1414,26 @@ textarea {
 @media (max-width: 680px) {
   .main-screen {
     padding: 12px;
+  }
+
+  .room-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .room-actions {
+    flex-wrap: wrap;
+    justify-content: stretch;
+  }
+
+  .po-message-form {
+    grid-template-columns: minmax(0, 1fr) auto;
+    width: 100%;
+  }
+
+  .stop-resume-button,
+  #openDecisionButton {
+    flex: 1 1 auto;
   }
 
   .agent-strip {

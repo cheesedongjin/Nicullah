@@ -34,6 +34,8 @@ TICKET_STATUS_ALIASES = {
     "needs_review": "review",
 }
 TICKET_STATUSES = {"ready", "progress", "review", "blocked", "done"}
+STOPPING_STATUSES = {"stopping", "stopped"}
+RESUME_NOTES_PATH = "docs/RESUME.md"
 
 AGENT_ORDER = ["pm", "designer", "backend", "frontend", "qa"]
 AGENTS = {
@@ -126,6 +128,7 @@ TEAM_PROTOCOL = [
     "Before changing another role's contract, read their artifact first and either adapt or hand off a precise mismatch.",
     "If one role is blocked by PO approval, keep all non-blocked work moving.",
     "Do not ask PO for routine engineering choices; make conservative professional decisions and document them.",
+    "Ask PO for a choice when a product, UX, brand, or design-direction decision has multiple reasonable outcomes.",
 ]
 
 state_lock = threading.RLock()
@@ -218,6 +221,36 @@ def append_log(state: dict, agent: str, message: str, level: str = "info") -> No
     state["logs"] = state["logs"][-300:]
 
 
+def create_pending_decision(
+    state: dict,
+    agent_id: str,
+    approval: dict,
+    *,
+    source: str = "agent",
+) -> dict:
+    agent_label = AGENTS.get(agent_id, {}).get("label", agent_id)
+    decision = {
+        "id": make_id("decision"),
+        "agent": agent_id,
+        "question": str(approval.get("question") or "PO approval is required."),
+        "options": normalize_decision_options(approval.get("options")),
+        "created_at": now(),
+        "source": source,
+    }
+    if approval.get("allow_colors") or approval.get("requires_colors") or approval.get("color_required"):
+        decision["allow_colors"] = True
+    state.setdefault("pending_decisions", []).append(decision)
+
+    if approval.get("blocks_agent", True) and agent_id in state.get("agents", {}):
+        state["agents"][agent_id]["blocked"] = True
+        state["agents"][agent_id]["status"] = "blocked"
+        state["agents"][agent_id]["message"] = "Waiting for PO approval"
+        state["agents"][agent_id]["updated_at"] = now()
+
+    append_log(state, agent_label, f"requested PO approval: {decision['question']}", "approval")
+    return decision
+
+
 def make_id(prefix: str) -> str:
     return f"{prefix}-{time.time_ns()}"
 
@@ -242,6 +275,35 @@ def normalize_ticket_status(value) -> str:
     return status if status in TICKET_STATUSES else "ready"
 
 
+def normalize_decision_options(value) -> list[dict]:
+    options = []
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, dict):
+                option = dict(item)
+            else:
+                option = {"title": str(item)}
+            option["id"] = str(option.get("id") or f"option-{index + 1}")
+            option["title"] = str(option.get("title") or option["id"])
+            option["description"] = str(option.get("description") or "")
+            option["colors"] = normalize_colors(option.get("colors"))
+            if option.get("recommendation") is not None:
+                option["recommendation"] = str(option.get("recommendation"))
+            options.append(option)
+    return options
+
+
+def normalize_colors(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    colors = []
+    for item in value:
+        color = str(item or "").strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            colors.append(color)
+    return colors[:6]
+
+
 def unresolved_handoff(handoff: dict) -> bool:
     return handoff.get("status") not in {"resolved", "closed"}
 
@@ -257,6 +319,11 @@ def acknowledge_handoffs(state: dict, agent_id: str) -> int:
             handoff["status"] = "received"
             handoff["received_at"] = now()
             count += 1
+    if agent_id == "pm":
+        for message in state.get("po_messages", []):
+            if message.get("status") == "open":
+                message["status"] = "received"
+                message["received_at"] = now()
     return count
 
 
@@ -428,6 +495,125 @@ def project_tree(root: Path, limit: int = 80) -> str:
     return "\n".join(lines) or "(empty project directory)"
 
 
+def po_message_needs_design_selection(message: str) -> bool:
+    lowered = message.lower()
+    design_terms = [
+        "ui",
+        "ux",
+        "design",
+        "modern",
+        "visual",
+        "style",
+        "look",
+        "feel",
+        "모던",
+        "현대",
+        "디자인",
+        "스타일",
+        "화면",
+        "브랜드",
+        "시각",
+    ]
+    exact_terms = ["dark mode", "다크 모드", "라이트 모드", "버튼", "색상 #", "font"]
+    return any(term in lowered for term in design_terms) and not any(term in lowered for term in exact_terms)
+
+
+def fallback_design_selection(message: str) -> dict:
+    return {
+        "question": f"'{message}' 요청을 어떤 디자인 방향으로 진행할까요?",
+        "options": [
+            {
+                "id": "modern-ops",
+                "title": "정돈된 운영형 UI",
+                "description": "정보 밀도와 가독성을 높이고, 카드보다 표면/구획 중심으로 차분하게 현대화합니다.",
+                "recommendation": "Recommended",
+                "colors": ["#101413", "#4cc9f0", "#e8f971"],
+            },
+            {
+                "id": "bold-product",
+                "title": "강한 제품형 UI",
+                "description": "대비, 타이포그래피, 주요 액션을 더 선명하게 만들어 제품 데모 느낌을 강화합니다.",
+                "recommendation": "Expressive",
+                "colors": ["#090b10", "#ff6b6b", "#ffd166"],
+            },
+            {
+                "id": "clean-saas",
+                "title": "깨끗한 SaaS형 UI",
+                "description": "여백, 밝은 표면, 절제된 포인트 컬러로 더 범용적이고 친숙한 화면을 만듭니다.",
+                "recommendation": "Neutral",
+                "colors": ["#f8fafc", "#2563eb", "#10b981"],
+            },
+        ],
+        "blocks_agent": True,
+    }
+
+
+def markdown_list(items: list[str], fallback: str = "- None") -> str:
+    return "\n".join(f"- {item}" for item in items) if items else fallback
+
+
+def write_resume_notes(root: Path, state: dict, reason: str = "Graceful stop requested") -> Path:
+    docs = root / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    target = root / RESUME_NOTES_PATH
+
+    tickets = state.get("tickets", [])
+    open_tickets = [
+        f"{ticket.get('priority', 'P2')} {ticket.get('id', '')} [{ticket.get('status', 'ready')}] "
+        f"{ticket.get('title', 'Untitled')} ({ticket.get('owner', 'unassigned')})"
+        for ticket in tickets
+        if ticket.get("status") != "done"
+    ][:25]
+    decisions = [
+        f"{decision.get('id')}: {decision.get('question', '')} ({decision.get('agent', 'pm')})"
+        for decision in state.get("pending_decisions", [])
+    ][:10]
+    handoffs = [
+        f"{handoff.get('from')} -> {handoff.get('to')}: {handoff.get('message', '')[:180]}"
+        for handoff in state.get("handoffs", [])
+        if unresolved_handoff(handoff)
+    ][-15:]
+    po_messages = [
+        f"{message.get('status', 'open')}: {message.get('message', '')[:180]}"
+        for message in state.get("po_messages", [])
+    ][-10:]
+    recent_logs = [
+        f"{log.get('agent')}: {log.get('message', '')[:180]}"
+        for log in state.get("logs", [])
+    ][-12:]
+
+    content = f"""# Resume Notes
+
+Generated: {now()}
+Reason: {reason}
+Project: {state.get('name', '')}
+Status at stop: {state.get('status', '')}
+Iteration: {state.get('iteration', 0)}
+
+## How to Resume
+- Press Resume in Nicullah, or call the project resume API.
+- PM should read this file first, then update docs/backlog.md and hand off the next smallest runnable slice.
+- If pending PO decisions exist, resolve them before asking blocked agents to continue.
+
+## Open Tickets
+{markdown_list(open_tickets)}
+
+## Pending PO Decisions
+{markdown_list(decisions)}
+
+## Open Handoffs
+{markdown_list(handoffs)}
+
+## Recent PO Messages
+{markdown_list(po_messages)}
+
+## Recent Activity
+{markdown_list(recent_logs)}
+"""
+    target.write_text(content, encoding="utf-8")
+    return target
+
+
 def read_excerpt(path: Path, max_chars: int = 10000) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -450,6 +636,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
         "openapi.yaml",
         "docs/database.md",
         "docs/test_plan.md",
+        RESUME_NOTES_PATH,
     ]
     files_to_read = list(dict.fromkeys(core_files + AGENTS[agent_id].get("artifacts", [])))
     excerpts = {}
@@ -465,6 +652,9 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
             "directory": str(root),
             "status": state["status"],
             "iteration": state.get("iteration", 0),
+            "stop_requested": bool(state.get("stop_requested")),
+            "graceful_stop_active": bool(state.get("graceful_stop_active")),
+            "resume_notes_file": RESUME_NOTES_PATH,
         },
         "current_agent": agent_id,
         "agents": state.get("agents", {}),
@@ -478,6 +668,11 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
         "command_runs": state.get("command_runs", [])[-10:],
         "previews": state.get("previews", [])[-10:],
         "approval_history": state.get("approval_history", [])[-10:],
+        "po_messages": state.get("po_messages", [])[-20:],
+        "open_po_messages": [
+            item for item in state.get("po_messages", [])
+            if item.get("status") in {"open", "received"}
+        ][-10:],
         "recent_logs": state.get("logs", [])[-20:],
         "file_tree": project_tree(root),
         "file_excerpts": excerpts,
@@ -498,6 +693,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
             "handoff",
             "resolve_handoff",
             "record_review",
+            "request_po_approval",
             "set_status",
             "complete_task",
         ],
@@ -514,6 +710,16 @@ Work like a real senior programming team member. Continue proactively when the p
 Ask PO approval only for product direction, external paid services, credentials/secrets,
 destructive filesystem operations, irreversible architecture choices, or mutually exclusive UX choices.
 If you need approval, return approval_required and mark only your own work blocked; other agents may continue.
+You must request PO approval instead of silently choosing when PO asks for a broad UI/design/brand direction
+or when you want to present multiple product/design candidates. Example: if PO says "UI를 더 모던하게 바꿔줘",
+PM should say it will present design candidates, then return approval_required or request_po_approval with options.
+Approval options are generated by you for the current project context; do not rely on fixed default candidates.
+Include colors only when the decision is actually about palette, brand, theme, visual style, or another color-bearing UI choice.
+For non-color decisions, omit colors and do not set allow_colors.
+If open_po_messages contains PO instructions and you are PM, acknowledge them, update the plan/backlog,
+and hand off revised work. If the instruction is exact, such as adding dark mode, revise the plan and continue.
+If project.graceful_stop_active is true, do not start new feature scope. Finish the smallest useful slice,
+make the project runnable if possible, update {RESUME_NOTES_PATH} with resume notes, and stop cleanly.
 
 Role responsibilities:
 {bullet_list(agent['responsibilities'])}
@@ -536,6 +742,7 @@ Return strict JSON only:
     "options": [
       {{"id": "option-a", "title": "Option A", "description": "tradeoff", "recommendation": "Recommended"}}
     ],
+    "allow_colors": false,
     "blocks_agent": true
   }},
   "actions": [
@@ -552,6 +759,7 @@ Return strict JSON only:
     {{"type": "handoff", "to": "pm|designer|backend|frontend|qa|all", "message": "next action needed", "files": ["path"], "ticket_id": "ticket-id", "priority": "normal|high"}},
     {{"type": "resolve_handoff", "id": "handoff-id", "resolution": "what was done"}},
     {{"type": "record_review", "target": "pm|designer|backend|frontend|qa", "verdict": "pass|needs_changes|blocked", "findings": ["finding"], "files": ["path"]}},
+    {{"type": "request_po_approval", "question": "question for PO", "options": [{{"id": "option-a", "title": "Option A", "description": "tradeoff", "recommendation": "Recommended"}}], "allow_colors": false, "blocks_agent": true}},
     {{"type": "set_status", "status": "running|waiting_for_approval|complete"}},
     {{"type": "complete_task", "summary": "what is complete"}}
   ]
@@ -981,6 +1189,9 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
                         "created_at": now(),
                     })
                 observations.append(f"recorded {review['verdict']} review for {target}")
+            elif action_type == "request_po_approval":
+                decision = create_pending_decision(state, agent_id, action, source="action")
+                observations.append(f"requested PO approval {decision['id']}")
             elif action_type == "set_status":
                 state["status"] = action.get("status", state.get("status", "running"))
                 observations.append(f"status set to {state['status']}")
@@ -1025,26 +1236,54 @@ def run_agent_turn(root: Path, state: dict, agent_id: str, runner_token: str | N
 
     approval = response.get("approval_required")
     if approval:
-        decision = {
-            "id": f"decision-{int(time.time() * 1000)}",
-            "agent": agent_id,
-            "question": approval.get("question", "Approval required"),
-            "options": approval.get("options", []),
-            "created_at": now(),
-        }
-        state.setdefault("pending_decisions", []).append(decision)
-        if approval.get("blocks_agent", True):
-            agent_state["blocked"] = True
-            agent_state["status"] = "blocked"
-            agent_state["message"] = "Waiting for PO approval"
-        append_log(state, agent["label"], f"requested PO approval: {decision['question']}", "approval")
+        create_pending_decision(state, agent_id, approval, source="approval_required")
 
     observations = execute_actions(root, state, agent_id, response.get("actions", []))
     for observation in observations[-5:]:
         append_log(state, agent["label"], observation)
+    if agent_id == "pm":
+        for message in state.get("po_messages", []):
+            if message.get("status") in {"open", "received"}:
+                message["status"] = "handled"
+                message["handled_at"] = now()
     if not agent_state.get("blocked"):
         agent_state["status"] = "idle"
     save_state(root, state)
+
+
+def complete_graceful_stop(root: Path, state: dict, runner_token: str | None = None) -> bool:
+    append_log(state, "System", "Graceful stop requested. Agents are stabilizing the current work.", "warning")
+    state["status"] = "stopping"
+    state["graceful_stop_active"] = True
+    save_state(root, state)
+
+    for agent_id in AGENT_ORDER:
+        state = load_state(root)
+        if runner_token and state.get("runner_token") != runner_token:
+            return False
+        if state.get("agents", {}).get(agent_id, {}).get("blocked"):
+            continue
+        run_agent_turn(root, state, agent_id, runner_token)
+
+    state = load_state(root)
+    if runner_token and state.get("runner_token") != runner_token:
+        return False
+
+    state.pop("graceful_stop_active", None)
+    state["stop_requested"] = False
+    state["status"] = "stopped"
+    state["running"] = False
+    state["runner_token"] = None
+    state["stopped_at"] = now()
+    for agent_state in state.get("agents", {}).values():
+        if agent_state.get("status") == "running":
+            agent_state["status"] = "idle"
+            agent_state["message"] = "Stopped after current work"
+            agent_state["updated_at"] = now()
+    resume_path = write_resume_notes(root, state)
+    append_log(state, "System", f"Gracefully stopped. Resume notes written to {resume_path.relative_to(root)}.", "warning")
+    save_state(root, state)
+    return True
 
 
 def run_project_loop(project_id: str, runner_token: str) -> None:
@@ -1056,9 +1295,14 @@ def run_project_loop(project_id: str, runner_token: str) -> None:
                 return
             state["runner_token"] = runner_token
             state["running"] = True
-            state["status"] = "running"
+            if state.get("status") not in STOPPING_STATUSES:
+                state["status"] = "running"
             state["iteration"] = state.get("iteration", 0) + 1
             save_state(root, state)
+
+            if state.get("stop_requested") or state.get("status") == "stopping":
+                complete_graceful_stop(root, state, runner_token)
+                return
 
             runnable = [
                 agent_id for agent_id in AGENT_ORDER
@@ -1077,6 +1321,10 @@ def run_project_loop(project_id: str, runner_token: str) -> None:
                 if state.get("agents", {}).get(agent_id, {}).get("blocked"):
                     continue
                 run_agent_turn(root, state, agent_id, runner_token)
+                state = load_state(root)
+                if state.get("stop_requested") or state.get("status") == "stopping":
+                    complete_graceful_stop(root, state, runner_token)
+                    return
                 time.sleep(0.2)
 
             state = load_state(root)
@@ -1139,7 +1387,9 @@ def mark_stale_runner_recovered(root: Path, state: dict, age: float | None, resu
 
 def maybe_recover_or_resume_runner(root: Path, state: dict) -> None:
     project_id = state.get("id")
-    if not project_id or state.get("pending_decisions"):
+    if not project_id:
+        return
+    if state.get("pending_decisions") and state.get("status") != "stopping":
         return
 
     age = seconds_since(state.get("updated_at"))
@@ -1150,6 +1400,15 @@ def maybe_recover_or_resume_runner(root: Path, state: dict) -> None:
         mark_stale_runner_recovered(root, state, age, resume=should_resume)
         if should_resume:
             ensure_runner(project_id, force=True)
+        elif state.get("status") == "stopping":
+            state = load_state(root)
+            state["stop_requested"] = False
+            state["status"] = "stopped"
+            state["running"] = False
+            state["runner_token"] = None
+            write_resume_notes(root, state, "Recovered stale graceful stop")
+            append_log(state, "System", "Recovered stale graceful stop and wrote resume notes.", "warning")
+            save_state(root, state)
     elif state.get("status") == "running" and not state.get("running") and not thread_alive:
         ensure_runner(project_id)
 
@@ -1215,6 +1474,7 @@ def create_project(payload: dict) -> dict:
         "directory": str(root),
         "status": "created",
         "running": False,
+        "stop_requested": False,
         "iteration": 0,
         "created_at": now(),
         "updated_at": now(),
@@ -1233,6 +1493,7 @@ def create_project(payload: dict) -> dict:
         "handoffs": [],
         "reviews": [],
         "approval_history": [],
+        "po_messages": [],
         "logs": [],
         "command_runs": [],
         "previews": [],
@@ -1249,6 +1510,7 @@ def approve_decision(project_id: str, payload: dict) -> dict:
     decision_id = payload.get("decision_id")
     choice_id = payload.get("choice_id")
     note = payload.get("note", "")
+    custom_colors = normalize_colors(payload.get("custom_colors"))
     pending = state.get("pending_decisions", [])
     decision = next((item for item in pending if item["id"] == decision_id), None)
     if not decision:
@@ -1259,14 +1521,17 @@ def approve_decision(project_id: str, payload: dict) -> dict:
         state["agents"][agent_id]["blocked"] = False
         state["agents"][agent_id]["status"] = "idle"
         state["agents"][agent_id]["message"] = "PO approved; resuming"
-    state.setdefault("approval_history", []).append({
+    history_entry = {
         "decision_id": decision_id,
         "agent": agent_id,
         "question": decision.get("question", ""),
         "choice_id": choice_id,
         "note": note,
         "time": now(),
-    })
+    }
+    if custom_colors:
+        history_entry["custom_colors"] = custom_colors
+    state.setdefault("approval_history", []).append(history_entry)
     append_log(
         state,
         "PO",
@@ -1277,6 +1542,104 @@ def approve_decision(project_id: str, payload: dict) -> dict:
     save_state(root, state)
     ensure_runner(project_id)
     return public_state(state)
+
+
+def stop_project(project_id: str) -> dict:
+    root = project_root(project_id)
+    state = load_state(root)
+    if state.get("status") == "stopped":
+        return public_state(state)
+
+    state["stop_requested"] = True
+    state["stop_requested_at"] = now()
+    state["status"] = "stopping"
+    append_log(
+        state,
+        "PO",
+        "Requested work stop. Agents will finish the current turn, stabilize runnable work, and write resume notes.",
+        "warning",
+    )
+
+    if not state.get("running") or not runner_thread_alive(project_id):
+        state["graceful_stop_active"] = False
+        state["stop_requested"] = False
+        state["status"] = "stopped"
+        state["running"] = False
+        state["runner_token"] = None
+        state["stopped_at"] = now()
+        resume_path = write_resume_notes(root, state)
+        append_log(state, "System", f"Stopped immediately. Resume notes written to {resume_path.relative_to(root)}.", "warning")
+
+    save_state(root, state)
+    return public_state(state)
+
+
+def resume_project(project_id: str) -> dict:
+    root = project_root(project_id)
+    state = load_state(root)
+    state["stop_requested"] = False
+    state.pop("graceful_stop_active", None)
+    state["status"] = "running"
+    for agent_state in state.get("agents", {}).values():
+        if agent_state.get("status") not in {"blocked", "error"}:
+            agent_state["status"] = "idle"
+            agent_state["message"] = f"Resuming from {RESUME_NOTES_PATH}"
+            agent_state["updated_at"] = now()
+    append_log(state, "PO", f"Resumed work. PM should consult {RESUME_NOTES_PATH}.", "info")
+    save_state(root, state)
+    ensure_runner(project_id)
+    return public_state(load_state(root))
+
+
+def send_po_message(project_id: str, payload: dict) -> dict:
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise ValueError("Message is required.")
+
+    root = project_root(project_id)
+    state = load_state(root)
+    entry = {
+        "id": make_id("po-message"),
+        "from": "PO",
+        "to": "pm",
+        "message": message,
+        "status": "open",
+        "created_at": now(),
+    }
+    state.setdefault("po_messages", []).append(entry)
+    state["po_messages"] = state["po_messages"][-100:]
+    state.setdefault("handoffs", []).append({
+        "id": make_id("handoff"),
+        "from": "po",
+        "to": "pm",
+        "message": message,
+        "files": [],
+        "ticket_id": "",
+        "priority": "high",
+        "status": "open",
+        "created_at": now(),
+    })
+    append_log(state, "PO", message, "po_message")
+
+    fallback_needed = (
+        po_message_needs_design_selection(message)
+        and not state.get("pending_decisions")
+        and not gemini_status()["ready"]
+    )
+    if fallback_needed:
+        append_log(state, "PM", "AI is unavailable, so fallback design options were prepared.", "approval")
+        create_pending_decision(state, "pm", fallback_design_selection(message), source="fallback_po_message")
+        entry["status"] = "awaiting_po_decision"
+        entry["decision_id"] = state["pending_decisions"][-1]["id"]
+
+    state["stop_requested"] = False
+    state.pop("graceful_stop_active", None)
+    if state.get("status") in {"stopped", "stopping", "waiting_for_handoff", "created"}:
+        state["status"] = "running"
+
+    save_state(root, state)
+    ensure_runner(project_id)
+    return public_state(load_state(root))
 
 
 class WarRoomHandler(SimpleHTTPRequestHandler):
@@ -1355,8 +1718,13 @@ class WarRoomHandler(SimpleHTTPRequestHandler):
                 self.write_json(create_project(payload), 201)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "resume":
-                ensure_runner(parts[2])
-                self.write_json(public_state(load_state(project_root(parts[2]))))
+                self.write_json(resume_project(parts[2]))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "stop":
+                self.write_json(stop_project(parts[2]))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "messages":
+                self.write_json(send_po_message(parts[2], payload))
                 return
             if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "approve":
                 self.write_json(approve_decision(parts[2], payload))
