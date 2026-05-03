@@ -116,12 +116,16 @@
           <div class="info-column">
             <div class="tab-bar" role="tablist">
               <button class="tab-btn is-active" data-tab="logs" role="tab" type="button">활동 로그</button>
+              <button class="tab-btn" data-tab="chat" role="tab" type="button">PM 채팅</button>
               <button class="tab-btn" data-tab="progress" role="tab" type="button">진행 상황</button>
               <button class="tab-btn" data-tab="files" role="tab" type="button">파일</button>
             </div>
             <div class="tab-content">
               <div class="tab-panel" id="tab-logs" role="tabpanel">
                 <ol class="activity-feed" id="activityFeed" aria-label="에이전트 로그"></ol>
+              </div>
+              <div class="tab-panel" id="tab-chat" role="tabpanel" hidden>
+                <div class="pm-chat-panel" id="pmChatPanel" aria-label="PO와 PM 채팅"></div>
               </div>
               <div class="tab-panel" id="tab-progress" role="tabpanel" hidden>
                 <div id="progressPanel"></div>

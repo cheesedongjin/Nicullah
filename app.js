@@ -182,6 +182,7 @@ function renderWarRoom() {
   setAgent("qa", agents.qa);
 
   renderActivity(project);
+  renderPmChat(project);
   renderProgress(project);
 
   if (state.activeTab === "files") renderFiles(project);
@@ -218,7 +219,7 @@ function renderPoMessageForm(project) {
   const enabled = Boolean(project);
   input.disabled = !enabled;
   button.disabled = !enabled || !input.value.trim();
-  input.placeholder = enabled ? "PM에게 지시 또는 피드백 보내기" : "프로젝트를 먼저 선택하세요";
+  input.placeholder = enabled ? "PM에게 질문, 지시, 피드백 보내기" : "프로젝트를 먼저 선택하세요";
 }
 
 function maybeAutoOpenDecision(decision) {
@@ -279,6 +280,36 @@ function renderActivity(project) {
       </li>`,
     )
     .join("");
+}
+
+function renderPmChat(project) {
+  const panel = $("#pmChatPanel");
+  if (!panel) return;
+  const messages = project?.pm_chat || [];
+  if (!project) {
+    panel.innerHTML = `<p class="empty-state">프로젝트를 선택하세요.</p>`;
+    return;
+  }
+  if (!messages.length) {
+    panel.innerHTML = `<p class="empty-state">PO가 질문을 보내면 PM이 여기에서 이어서 답합니다.</p>`;
+    return;
+  }
+
+  panel.innerHTML = messages
+    .map((item) => {
+      const from = item.from || "PM";
+      const speaker = from.toLowerCase() === "po" ? "po" : "pm";
+      return `
+        <article class="chat-message" data-speaker="${speaker}">
+          <div class="chat-meta">
+            <strong>${escapeHtml(from)}</strong>
+            ${item.created_at ? `<time>${item.created_at.slice(11, 16)}</time>` : ""}
+          </div>
+          <p>${escapeHtml(item.message || "")}</p>
+        </article>`;
+    })
+    .join("");
+  panel.scrollTop = panel.scrollHeight;
 }
 
 // ─── Progress panel ──────────────────────────────────────────────────────────
@@ -793,12 +824,14 @@ async function handlePoMessage(event) {
   const button = $("#poMessageButton");
   button.disabled = true;
   try {
-    await api(`/api/projects/${project.id}/messages`, {
+    const updated = await api(`/api/projects/${project.id}/messages`, {
       method: "POST",
       body: JSON.stringify({ message }),
     });
+    const lastChat = (updated.pm_chat || []).at(-1);
     input.value = "";
     await refreshProjects();
+    if (lastChat?.from === "PM") switchTab("chat");
   } finally {
     renderPoMessageForm(activeProject());
   }

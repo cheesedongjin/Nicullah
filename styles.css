@@ -607,6 +607,11 @@ h1 {
   background: rgba(19, 220, 237, 0.05);
 }
 
+.activity-feed li[data-level="po_chat"] {
+  border-left-color: var(--accent);
+  background: rgba(217, 255, 139, 0.04);
+}
+
 .activity-feed li strong {
   display: block;
   margin-bottom: 3px;
@@ -630,6 +635,74 @@ h1 {
   color: var(--soft);
   font-family: "Cascadia Mono", "Consolas", monospace;
   font-size: 10px;
+}
+
+/* ─── PM chat ────────────────────────────────────── */
+
+#tab-chat {
+  overflow: hidden;
+}
+
+.pm-chat-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(217, 255, 139, 0.15) transparent;
+}
+
+.chat-message {
+  width: min(86%, 300px);
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.chat-message[data-speaker="po"] {
+  align-self: flex-end;
+  border-color: rgba(19, 220, 237, 0.25);
+  background: rgba(19, 220, 237, 0.06);
+}
+
+.chat-message[data-speaker="pm"] {
+  align-self: flex-start;
+  border-color: rgba(217, 255, 139, 0.2);
+  background: rgba(217, 255, 139, 0.05);
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--soft);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chat-meta strong {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.chat-meta time {
+  color: var(--soft);
+}
+
+.chat-message p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ─── Progress panel ─────────────────────────────── */

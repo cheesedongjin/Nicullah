@@ -401,6 +401,71 @@ Use this:
         self.assertTrue(public["agents"]["pm"]["blocked"])
         self.assertEqual(public["po_messages"][0]["status"], "awaiting_po_decision")
 
+    def test_question_po_message_records_pm_chat_without_resuming_work(self):
+        with workspace_tempdir() as tmp:
+            root = Path(tmp)
+            (root / ".warroom").mkdir(parents=True)
+            state = {
+                "id": "project-demo",
+                "name": "Demo",
+                "vision": "Build a product",
+                "directory": str(root),
+                "status": "stopped",
+                "running": False,
+                "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+                "pending_decisions": [],
+                "handoffs": [],
+                "po_messages": [],
+                "pm_chat": [],
+                "logs": [],
+            }
+            app.save_state(root, state)
+
+            with patch("app.project_root", return_value=root), patch("app.ensure_runner") as ensure_runner, patch(
+                "app.classify_pm_chat_message",
+                return_value={
+                    "mode": "chat",
+                    "reply": "The project is currently stopped.",
+                    "agent_status": "Answered status question",
+                },
+            ):
+                public = app.send_po_message("project-demo", {"message": "What is the current status?"})
+
+        self.assertEqual(public["status"], "stopped")
+        self.assertEqual(public["po_messages"][0]["status"], "chat_replied")
+        self.assertEqual([item["from"] for item in public["pm_chat"]], ["PO", "PM"])
+        self.assertEqual(public["pm_chat"][1]["message"], "The project is currently stopped.")
+        self.assertEqual(public["agents"]["pm"]["message"], "Answered status question")
+        ensure_runner.assert_not_called()
+
+    def test_reply_to_po_action_records_chat_memory(self):
+        state = {
+            "agents": {"pm": {"status": "idle", "message": "Ready", "blocked": False}},
+            "po_messages": [
+                {
+                    "id": "po-message-1",
+                    "from": "PO",
+                    "to": "pm",
+                    "message": "Can we ship today?",
+                    "status": "open",
+                }
+            ],
+            "pm_chat": [],
+            "logs": [],
+        }
+
+        observations = app.execute_actions(
+            ROOT,
+            state,
+            "pm",
+            [{"type": "reply_to_po", "message_id": "po-message-1", "message": "Not yet; QA is still open."}],
+        )
+
+        self.assertIn("replied to PO chat", observations)
+        self.assertEqual(state["po_messages"][0]["status"], "chat_replied")
+        self.assertEqual([item["from"] for item in state["pm_chat"]], ["PO", "PM"])
+        self.assertEqual(state["pm_chat"][1]["message"], "Not yet; QA is still open.")
+
     def test_stop_project_writes_resume_notes_when_not_running(self):
         with workspace_tempdir() as tmp:
             root = Path(tmp)
@@ -451,6 +516,7 @@ Use this:
             "command_runs": [{"returncode": 0}],
             "previews": [{"review": "layout ok"}],
             "approval_history": [],
+            "pm_chat": [{"from": "PO", "message": "What is left?"}],
             "logs": [],
         }
 
@@ -460,6 +526,7 @@ Use this:
         self.assertIn("README.md", context["file_excerpts"])
         self.assertIn("record_review", context["allowed_actions"])
         self.assertEqual(context["previews"][0]["review"], "layout ok")
+        self.assertEqual(context["pm_chat"][0]["message"], "What is left?")
 
     def test_project_tree_prunes_dependency_directories(self):
         with workspace_tempdir() as tmp:

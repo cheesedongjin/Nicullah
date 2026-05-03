@@ -331,6 +331,7 @@ def public_state(state: dict) -> dict:
     public = dict(state)
     public["directory"] = str(Path(state["directory"]))
     public["max_agent_steps"] = MAX_AGENT_STEPS
+    public.setdefault("pm_chat", [])
     return public
 
 
@@ -548,6 +549,122 @@ def fallback_design_selection(message: str) -> dict:
     }
 
 
+def po_message_chat_candidate(message: str) -> bool:
+    lowered = message.lower().strip()
+    if not lowered:
+        return False
+
+    conversational_terms = [
+        "고마워",
+        "감사",
+        "좋아",
+        "오케이",
+        "ㅇㅋ",
+        "ok",
+        "okay",
+        "thanks",
+        "thank you",
+    ]
+    information_terms = [
+        "상태",
+        "현황",
+        "진행",
+        "요약",
+        "설명",
+        "알려줘",
+        "어떻게",
+        "무엇",
+        "뭐",
+        "왜",
+        "언제",
+        "어디",
+        "누가",
+        "가능",
+        "괜찮",
+        "맞아",
+        "맞나요",
+        "되나요",
+        "돼?",
+        "습니까",
+        "나요",
+    ]
+    question_markers = ["?", "？"]
+    return any(term in lowered for term in conversational_terms + information_terms + question_markers)
+
+
+def append_chat_message(
+    state: dict,
+    sender: str,
+    message: str,
+    *,
+    source_id: str | None = None,
+    reply_to: str | None = None,
+) -> dict:
+    entry = {
+        "id": make_id("chat"),
+        "from": sender,
+        "message": str(message or "").strip()[:4000],
+        "created_at": now(),
+    }
+    if source_id:
+        entry["source_id"] = source_id
+    if reply_to:
+        entry["reply_to"] = reply_to
+    state.setdefault("pm_chat", []).append(entry)
+    return entry
+
+
+def ensure_po_message_in_chat(state: dict, po_message: dict | None) -> dict | None:
+    if not po_message:
+        return None
+    chat_entry_id = po_message.get("chat_entry_id")
+    if chat_entry_id:
+        return next((item for item in state.get("pm_chat", []) if item.get("id") == chat_entry_id), None)
+    source_id = po_message.get("id")
+    existing = next(
+        (item for item in state.get("pm_chat", []) if source_id and item.get("source_id") == source_id),
+        None,
+    )
+    if existing:
+        po_message["chat_entry_id"] = existing["id"]
+        return existing
+    entry = append_chat_message(state, "PO", po_message.get("message", ""), source_id=source_id)
+    po_message["chat_entry_id"] = entry["id"]
+    return entry
+
+
+def record_pm_chat_reply(state: dict, po_message: dict | None, reply: str) -> dict:
+    po_chat = ensure_po_message_in_chat(state, po_message)
+    reply_entry = append_chat_message(
+        state,
+        "PM",
+        reply,
+        reply_to=po_chat.get("id") if po_chat else None,
+    )
+    if po_message is not None:
+        po_message["status"] = "chat_replied"
+        po_message["handled_at"] = now()
+    if "pm" in state.get("agents", {}):
+        state["agents"]["pm"]["status"] = "idle"
+        state["agents"]["pm"]["message"] = "Answered PO chat"
+        state["agents"]["pm"]["updated_at"] = now()
+    append_log(state, "PM", reply, "po_chat")
+    return reply_entry
+
+
+def latest_unanswered_po_message(state: dict, message_id: str | None = None) -> dict | None:
+    messages = state.setdefault("po_messages", [])
+    if message_id:
+        return next((item for item in messages if item.get("id") == message_id), None)
+    return next(
+        (
+            item for item in reversed(messages)
+            if item.get("status") in {"open", "received"}
+        ),
+        None,
+    )
+
+
 def markdown_list(items: list[str], fallback: str = "- None") -> str:
     return "\n".join(f"- {item}" for item in items) if items else fallback
 
@@ -576,6 +693,10 @@ def write_resume_notes(root: Path, state: dict, reason: str = "Graceful stop req
     po_messages = [
         f"{message.get('status', 'open')}: {message.get('message', '')[:180]}"
         for message in state.get("po_messages", [])
+    ][-10:]
+    pm_chat = [
+        f"{item.get('from', 'PM')}: {item.get('message', '')[:180]}"
+        for item in state.get("pm_chat", [])
     ][-10:]
     recent_logs = [
         f"{log.get('agent')}: {log.get('message', '')[:180]}"
@@ -606,6 +727,9 @@ Iteration: {state.get('iteration', 0)}
 
 ## Recent PO Messages
 {markdown_list(po_messages)}
+
+## Recent PM Chat
+{markdown_list(pm_chat)}
 
 ## Recent Activity
 {markdown_list(recent_logs)}
@@ -668,6 +792,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
         "command_runs": state.get("command_runs", [])[-10:],
         "previews": state.get("previews", [])[-10:],
         "approval_history": state.get("approval_history", [])[-10:],
+        "pm_chat": state.get("pm_chat", [])[-30:],
         "po_messages": state.get("po_messages", [])[-20:],
         "open_po_messages": [
             item for item in state.get("po_messages", [])
@@ -694,6 +819,7 @@ def collect_context(root: Path, state: dict, agent_id: str) -> dict:
             "resolve_handoff",
             "record_review",
             "request_po_approval",
+            "reply_to_po",
             "set_status",
             "complete_task",
         ],
@@ -718,6 +844,9 @@ Include colors only when the decision is actually about palette, brand, theme, v
 For non-color decisions, omit colors and do not set allow_colors.
 If open_po_messages contains PO instructions and you are PM, acknowledge them, update the plan/backlog,
 and hand off revised work. If the instruction is exact, such as adding dark mode, revise the plan and continue.
+If open_po_messages contains a PO question, status check, clarification, or casual chat that does not require
+creating/changing project work, answer it with reply_to_po and do not create tickets, handoffs, files, or commands.
+Use pm_chat as the remembered PO/PM conversation for this project session.
 If project.graceful_stop_active is true, do not start new feature scope. Finish the smallest useful slice,
 make the project runnable if possible, update {RESUME_NOTES_PATH} with resume notes, and stop cleanly.
 
@@ -760,6 +889,7 @@ Return strict JSON only:
     {{"type": "resolve_handoff", "id": "handoff-id", "resolution": "what was done"}},
     {{"type": "record_review", "target": "pm|designer|backend|frontend|qa", "verdict": "pass|needs_changes|blocked", "findings": ["finding"], "files": ["path"]}},
     {{"type": "request_po_approval", "question": "question for PO", "options": [{{"id": "option-a", "title": "Option A", "description": "tradeoff", "recommendation": "Recommended"}}], "allow_colors": false, "blocks_agent": true}},
+    {{"type": "reply_to_po", "message_id": "po-message-id", "message": "direct PM chat reply when no project work is required"}},
     {{"type": "set_status", "status": "running|waiting_for_approval|complete"}},
     {{"type": "complete_task", "summary": "what is complete"}}
   ]
@@ -926,6 +1056,64 @@ def call_agent(root: Path, state: dict, agent_id: str) -> dict:
             return extract_json(repaired)
         except (json.JSONDecodeError, TypeError) as repair_error:
             return empty_agent_response(str(repair_error or original_error))
+
+
+def classify_pm_chat_message(root: Path, state: dict, message: str) -> dict:
+    client = require_gemini_client()
+    handler = GeminiRetryHandler(client)
+    context = {
+        "project": {
+            "name": state.get("name", ""),
+            "vision": state.get("vision", ""),
+            "status": state.get("status", ""),
+            "iteration": state.get("iteration", 0),
+            "directory": str(root),
+        },
+        "agents": state.get("agents", {}),
+        "tickets": state.get("tickets", [])[-20:],
+        "pending_decisions": state.get("pending_decisions", [])[-10:],
+        "handoffs": [
+            item for item in state.get("handoffs", [])
+            if unresolved_handoff(item)
+        ][-15:],
+        "approval_history": state.get("approval_history", [])[-10:],
+        "pm_chat": state.get("pm_chat", [])[-30:],
+        "recent_logs": state.get("logs", [])[-20:],
+        "po_message": message,
+    }
+    system_instruction = """
+You are the PM in Nicullah. Decide whether the PO message can be answered as chat
+without creating, changing, or sequencing project work.
+
+Return mode "chat" for questions, status checks, clarifications, acknowledgements,
+or casual conversation. Answer directly as PM using the project context and pm_chat memory.
+Return mode "work" when the PO asks to add, change, fix, build, design, test, document,
+or otherwise perform project work. For work mode, leave reply empty.
+
+Return strict JSON only:
+{"mode":"chat|work","reply":"PM answer when mode is chat","agent_status":"short visible PM status"}
+"""
+    text = handler.generate_response(
+        history=[],
+        message=json.dumps(context, ensure_ascii=False),
+        system_instruction=system_instruction,
+        temperature=0.2,
+        response_mime_type="application/json",
+    )
+    try:
+        result = extract_json(text)
+    except (json.JSONDecodeError, TypeError):
+        return {"mode": "work", "reply": "", "agent_status": "Queued for PM"}
+
+    mode = str(result.get("mode") or "work").strip().lower()
+    reply = str(result.get("reply") or "").strip()
+    if mode == "chat" and reply:
+        return {
+            "mode": "chat",
+            "reply": reply,
+            "agent_status": str(result.get("agent_status") or "Answered PO chat"),
+        }
+    return {"mode": "work", "reply": "", "agent_status": str(result.get("agent_status") or "Queued for PM")}
 
 
 def resolve_command(root: Path, command: list[str]) -> list[str]:
@@ -1192,6 +1380,18 @@ def execute_actions(root: Path, state: dict, agent_id: str, actions: list[dict])
             elif action_type == "request_po_approval":
                 decision = create_pending_decision(state, agent_id, action, source="action")
                 observations.append(f"requested PO approval {decision['id']}")
+            elif action_type == "reply_to_po":
+                if agent_id != "pm":
+                    raise ValueError("Only PM can reply directly to PO chat.")
+                reply = str(action.get("message") or action.get("reply") or "").strip()
+                if not reply:
+                    raise ValueError("reply_to_po requires a message")
+                po_message = latest_unanswered_po_message(
+                    state,
+                    action.get("message_id") or action.get("po_message_id"),
+                )
+                record_pm_chat_reply(state, po_message, reply)
+                observations.append("replied to PO chat")
             elif action_type == "set_status":
                 state["status"] = action.get("status", state.get("status", "running"))
                 observations.append(f"status set to {state['status']}")
@@ -1493,6 +1693,7 @@ def create_project(payload: dict) -> dict:
         "handoffs": [],
         "reviews": [],
         "approval_history": [],
+        "pm_chat": [],
         "po_messages": [],
         "logs": [],
         "command_runs": [],
@@ -1598,6 +1799,11 @@ def send_po_message(project_id: str, payload: dict) -> dict:
 
     root = project_root(project_id)
     state = load_state(root)
+
+    chat_result = None
+    if po_message_chat_candidate(message):
+        chat_result = classify_pm_chat_message(root, state, message)
+
     entry = {
         "id": make_id("po-message"),
         "from": "PO",
@@ -1608,6 +1814,15 @@ def send_po_message(project_id: str, payload: dict) -> dict:
     }
     state.setdefault("po_messages", []).append(entry)
     state["po_messages"] = state["po_messages"][-100:]
+
+    if chat_result and chat_result.get("mode") == "chat":
+        append_log(state, "PO", message, "po_message")
+        record_pm_chat_reply(state, entry, chat_result.get("reply", ""))
+        if "pm" in state.get("agents", {}):
+            state["agents"]["pm"]["message"] = chat_result.get("agent_status") or "Answered PO chat"
+        save_state(root, state)
+        return public_state(load_state(root))
+
     state.setdefault("handoffs", []).append({
         "id": make_id("handoff"),
         "from": "po",
